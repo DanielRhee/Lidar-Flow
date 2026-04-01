@@ -1,20 +1,20 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: djrhee-desktop # Change this to your djrhee
+  name: djrhee-lidarflow # Change this to your djrhee
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: djrhee-desktop # Change this to your djrhee
+      app: djrhee-lidarflow # Change this to your djrhee
   template:
     metadata:
       labels:
-        app: djrhee-desktop # Change this to your djrhee
+        app: djrhee-lidarflow # Change this to your djrhee
     spec:
-      hostname: djrhee-desktop # Change this to your djrhee
+      hostname: djrhee-lidarflow # Change this to your djrhee
       containers:
-      - name: djrhee-desktop # Change this to your djrhee
+      - name: djrhee-lidarflow # Change this to your djrhee
         image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704 # If you face compatibility issues, replace "latest" with "22.04-20240815104538" or any other tag found here https://github.com/selkies-project/docker-nvidia-glx-desktop/pkgs/container/nvidia-glx-desktop
         env:
         - name: TZ
@@ -90,7 +90,7 @@ spec:
           claimName: djrhee-lidarflow-cache # Change this to your djrhee
       - name: root-vol
         persistentVolumeClaim:
-          claimName: djrhee-carla # Change this to your djrhee
+          claimName: lidarflow # Change this to your djrhee
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:

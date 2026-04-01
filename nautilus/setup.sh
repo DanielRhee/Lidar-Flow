@@ -1,13 +1,13 @@
-NAME=cruzid-desktop # Change this to your cruzid
-POD_NAME=cruzid-carla # Change this to your cruzid
-CACHE_NAME=cruzid-carla-cache # Change this to your cruzid
+NAME=djrhee-lidarflow # Change this to your cruzid
+POD_NAME=djrhee-lidarflow # Change this to your cruzid
+CACHE_NAME=djrhee-lidarflow-cache # Change this to your cruzid
 
 if [ "$1" -eq 1 ]; then
     kubectl delete deployment $NAME
     kubectl delete service $NAME
     kubectl delete ingress $NAME
 elif [ "$1" -eq 0 ]; then
-    kubectl create -f storage.yml
+    kubectl create -f pvc.yml
     kubectl create -f cache.yml
     kubectl create -f desktop.yml
     kubectl create -f desktop-ingress.yml
