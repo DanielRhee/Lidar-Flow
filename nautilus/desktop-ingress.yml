@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: haproxy
+  name: djrhee-desktop # Change this to your cruzid
+spec:
+  ingressClassName: haproxy
+  rules:
+  - host: djrhee.nrp-nautilus.io # Change this to your cruzid
+    http:
+      paths:
+      - backend:
+          service:
+            name: djrhee-desktop # Change this to your cruzid
+            port:
+              name: http
+        path: /
+        pathType: ImplementationSpecific
+  tls:
+  - hosts:
+    - djrhee.nrp-nautilus.io # Change this to your cruzid
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: djrhee-desktop # Change this to your cruzid
+  labels:
+    app: djrhee-desktop # Change this to your cruzid
+spec:
+  selector:
+    app: djrhee-desktop # Change this to your cruzid
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8080

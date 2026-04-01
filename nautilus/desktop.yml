@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: djrhee-desktop # Change this to your djrhee
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: djrhee-desktop # Change this to your djrhee
+  template:
+    metadata:
+      labels:
+        app: djrhee-desktop # Change this to your djrhee
+    spec:
+      hostname: djrhee-desktop # Change this to your djrhee
+      containers:
+      - name: djrhee-desktop # Change this to your djrhee
+        image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704 # If you face compatibility issues, replace "latest" with "22.04-20240815104538" or any other tag found here https://github.com/selkies-project/docker-nvidia-glx-desktop/pkgs/container/nvidia-glx-desktop
+        env:
+        - name: TZ
+          value: "UTC"
+        - name: DISPLAY_SIZEW
+          value: "1920"
+        - name: DISPLAY_SIZEH
+          value: "1080"
+        - name: DISPLAY_REFRESH
+          value: "60"
+        - name: DISPLAY_DPI
+          value: "96"
+        - name: DISPLAY_CDEPTH
+          value: "24"
+        - name: VIDEO_PORT
+          value: "DFP"
+        - name: PASSWD
+          valueFrom:
+            secretKeyRef:
+              name: my-pass
+              key: my-pass
+        - name: SELKIES_ENCODER
+          value: "x264enc"
+        - name: SELKIES_ENABLE_RESIZE
+          value: "false"
+        - name: SELKIES_VIDEO_BITRATE
+          value: "8000"
+        - name: SELKIES_AUDIO_BITRATE
+          value: "128000"
+        - name: SELKIES_FRAMERATE
+          value: "60"
+        - name: SELKIES_ENABLE_BASIC_AUTH
+          value: "true"
+        - name: SELKIES_TURN_REST_URI
+          value: "http://turn-rest.nrp-nautilus.io"
+        - name: SELKIES_TURN_PROTOCOL
+          value: "udp"
+        - name: SELKIES_TURN_TLS
+          value: "false"
+        stdin: true
+        tty: true
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        resources:
+          limits:
+            memory: 32Gi
+            cpu: "16"
+            nvidia.com/gpu: 1
+            ephemeral-storage: 35Gi
+          requests:
+            memory: 8Gi
+            cpu: "4"
+            ephemeral-storage: 35Gi
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /cache
+          name: cache-vol
+        - mountPath: /home/ubuntu/persistent
+          name: root-vol
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+        - 8.8.8.8
+        - 8.8.4.4
+      volumes:
+      - name: dshm
+        emptyDir: {}
+      - name: cache-vol
+        persistentVolumeClaim:
+          claimName: djrhee-lidarflow-cache # Change this to your djrhee
+      - name: root-vol
+        persistentVolumeClaim:
+          claimName: djrhee-carla # Change this to your djrhee
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: NotIn
+                values:
+                - ucsd-suncave
