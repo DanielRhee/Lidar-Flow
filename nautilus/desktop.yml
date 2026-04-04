@@ -15,7 +15,7 @@ spec:
       hostname: djrhee-lidarflow # Change this to your djrhee
       containers:
       - name: djrhee-lidarflow # Change this to your djrhee
-        image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704 # If you face compatibility issues, replace "latest" with "22.04-20240815104538" or any other tag found here https://github.com/selkies-project/docker-nvidia-glx-desktop/pkgs/container/nvidia-glx-desktop
+        image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704
         env:
         - name: TZ
           value: "UTC"
