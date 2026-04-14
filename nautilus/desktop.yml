@@ -16,7 +16,7 @@ spec:
       containers:
       - name: djrhee-lidarflow # Change this to your djrhee
         image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704
-        env:
+        env:	
         - name: TZ
           value: "UTC"
         - name: DISPLAY_SIZEW
@@ -56,6 +56,7 @@ spec:
           value: "false"
         stdin: true
         tty: true
+        command: ["/home/ubuntu/persistent/start.sh"]
         ports:
         - name: http
           containerPort: 8080
@@ -68,7 +69,7 @@ spec:
             ephemeral-storage: 35Gi
           requests:
             memory: 8Gi
-            cpu: "4"
+            cpu: "8"
             ephemeral-storage: 35Gi
         volumeMounts:
         - mountPath: /dev/shm
@@ -90,7 +91,7 @@ spec:
           claimName: djrhee-lidarflow-cache # Change this to your djrhee
       - name: root-vol
         persistentVolumeClaim:
-          claimName: lidarflow # Change this to your djrhee
+          claimName: argoverse-challenge-v2 # Change this to your djrhee
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
