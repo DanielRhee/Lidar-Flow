@@ -16,7 +16,7 @@ spec:
       containers:
       - name: djrhee-lidarflow # Change this to your djrhee
         image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704
-        env:	
+        env:
         - name: TZ
           value: "UTC"
         - name: DISPLAY_SIZEW
@@ -56,7 +56,6 @@ spec:
           value: "false"
         stdin: true
         tty: true
-        command: ["/home/ubuntu/persistent/start.sh"]
         ports:
         - name: http
           containerPort: 8080
@@ -68,8 +67,8 @@ spec:
             nvidia.com/gpu: 1
             ephemeral-storage: 35Gi
           requests:
-            memory: 8Gi
-            cpu: "8"
+            memory: 12Gi
+            cpu: "12"
             ephemeral-storage: 35Gi
         volumeMounts:
         - mountPath: /dev/shm
