@@ -60,13 +60,15 @@ def saveBevPng(coords, spatialShape, voxelSize, pointRange, outPath):
  
 if __name__ == '__main__':
     # Vibecoded idk what the main/visualize stuff does
+    from pathlib import Path
     import numpy as np
     import matplotlib.pyplot as plt
     from av2.torch.data_loaders.scene_flow import SceneFlowDataloader
+    import pyarrow.feather as feather
  
     datasetDir = Path.home() / 'persistent' / 'data' / 'lidar'
     split = 'train'
-    sampleIdx = 0
+    logIdx = 0
     sweepIdx = 0
  
     voxelSize = 0.1
@@ -75,12 +77,16 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device: {device}')
  
-    loader = SceneFlowDataloader(root_dir=datasetDir, dataset_name='av2', split_name=split)
-    sample = loader[sampleIdx]
-    sweep = sample[sweepIdx]
+    splitDir = datasetDir / split
+    logDirs = sorted([d for d in splitDir.iterdir() if d.is_dir()])
+    logDir = logDirs[logIdx]
+    sweepFiles = sorted((logDir / 'sensors' / 'lidar').glob('*.feather'))
+    sweepPath = sweepFiles[sweepIdx]
+    print(f'log: {logDir.name}, sweep: {sweepPath.name}')
  
-    xyz = sweep.lidar.as_tensor()[:, :3].to(torch.float32)
-    intensity = sweep.lidar.as_tensor()[:, 3].to(torch.float32)
+    df = feather.read_feather(sweepPath)
+    xyz = torch.from_numpy(np.stack([df['x'].to_numpy(), df['y'].to_numpy(), df['z'].to_numpy()], axis=1)).to(torch.float32)
+    intensity = torch.from_numpy(df['intensity'].to_numpy()).to(torch.float32)
     points = torch.cat([xyz, intensity.unsqueeze(1)], dim=1).to(device)
  
     print(f'input points: {points.shape}, dtype={points.dtype}')
@@ -96,6 +102,6 @@ if __name__ == '__main__':
           f'y=[{coords[:,1].min().item()}, {coords[:,1].max().item()}], '
           f'z=[{coords[:,2].min().item()}, {coords[:,2].max().item()}]')
  
-    outPath = Path('/tmp/voxel_bev.png')
+    outPath = Path(__file__).parent / 'voxel_bev.png'
     saveBevPng(coords, spatialShape, voxelSize, pointRange, outPath)
     print(f'BEV saved to {outPath}')
