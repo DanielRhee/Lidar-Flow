@@ -26,6 +26,7 @@ def loadAnnotation(datasetDir, dataset, split, index):
 
     return pc0, pc1, flow
 
+# Visualize function was vibecoded. I am not making this myself lol
 def visualize(pc0, pc1, flow):
     def to_np(t):
         return t.detach().cpu().float().numpy()
@@ -95,10 +96,10 @@ def visualize(pc0, pc1, flow):
     print(f"[info] Saved → {out_path}")
 
 if __name__ == "__main__":
-    datasetDir = Path.home / "persistent" / "data"
+    datasetDir = Path.hom()e / "persistent" / "data"
     dataset = "lidar"
     split = "train"
     index = 0
     
-    pc0, pc1, flow = loadAnnotation(datasetDir, dataset, split)
+    pc0, pc1, flow = loadAnnotation(datasetDir, dataset, split, index)
     visualize(pc0, pc1, flow)
