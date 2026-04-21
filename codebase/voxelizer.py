@@ -41,3 +41,61 @@ def voxelize(points, voxelSize, pointRange):
     coords = torch.stack([xCoord, yCoord, zCoord], dim=1).to(torch.int32)
  
     return features, coords, spatialShape
+
+
+def saveBevPng(coords, spatialShape, voxelSize, pointRange, outPath):
+    bev = torch.zeros((spatialShape[0].item(), spatialShape[1].item()), dtype=torch.float32)
+    bev[coords[:, 0].long().cpu(), coords[:, 1].long().cpu()] = 1.0
+ 
+    plt.figure(figsize=(8, 8))
+    plt.imshow(bev.T.numpy(), origin='lower', cmap='gray_r',
+               extent=[pointRange[0], pointRange[3], pointRange[1], pointRange[4]])
+    plt.xlabel('x (m)')
+    plt.ylabel('y (m)')
+    plt.title('Occupied voxels (BEV)')
+    plt.tight_layout()
+    plt.savefig(outPath, dpi=100)
+    plt.close()
+ 
+ 
+if __name__ == '__main__':
+    # Vibecoded idk what the main/visualize stuff does
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from av2.torch.data_loaders.scene_flow import SceneFlowDataloader
+ 
+    datasetDir = Path.home() / 'persistent' / 'data' / 'lidar'
+    split = 'train'
+    sampleIdx = 0
+    sweepIdx = 0
+ 
+    voxelSize = 0.1
+    pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
+ 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'device: {device}')
+ 
+    loader = SceneFlowDataloader(root_dir=datasetDir, dataset_name='av2', split_name=split)
+    sample = loader[sampleIdx]
+    sweep = sample[sweepIdx]
+ 
+    xyz = sweep.lidar.as_tensor()[:, :3].to(torch.float32)
+    intensity = sweep.lidar.as_tensor()[:, 3].to(torch.float32)
+    points = torch.cat([xyz, intensity.unsqueeze(1)], dim=1).to(device)
+ 
+    print(f'input points: {points.shape}, dtype={points.dtype}')
+ 
+    features, coords, spatialShape = voxelize(points, voxelSize, pointRange)
+ 
+    print(f'spatial shape (Dx, Dy, Dz): {spatialShape.tolist()}')
+    print(f'occupied voxels: {features.shape[0]}')
+    totalVoxels = spatialShape.prod().item()
+    print(f'sparsity: {100.0 * (1.0 - features.shape[0] / totalVoxels):.4f}%')
+    print(f'feature stats: min={features.min().item():.4f}, max={features.max().item():.4f}, mean={features.mean().item():.4f}')
+    print(f'coord bounds: x=[{coords[:,0].min().item()}, {coords[:,0].max().item()}], '
+          f'y=[{coords[:,1].min().item()}, {coords[:,1].max().item()}], '
+          f'z=[{coords[:,2].min().item()}, {coords[:,2].max().item()}]')
+ 
+    outPath = Path('/tmp/voxel_bev.png')
+    saveBevPng(coords, spatialShape, voxelSize, pointRange, outPath)
+    print(f'BEV saved to {outPath}')
