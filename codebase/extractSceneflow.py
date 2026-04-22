@@ -2,15 +2,17 @@ import torch
 from av2.torch.data_loaders.scene_flow import SceneFlowDataloader
 from pathlib import Path
 
-# Load a specific annotaiton in the dataset and correct the following sweep's ego motion. 2 modified point clouds as tensors and the flow 
-def loadAnnotation(datasetDir, dataset, split, index):
-    loader = SceneFlowDataloader(
+def buildLoader(datasetDir, dataset, split):
+    return SceneFlowDataloader(
         root_dir=datasetDir,
         dataset_name=dataset,
         split_name=split,
         num_accumulated_sweeps=1,
         memory_mapped=False,
     )
+
+# Load a specific annotaiton in the dataset and correct the following sweep's ego motion. 2 modified point clouds as tensors and the flow 
+def loadAnnotation(loader, index):
     sweep0, sweep1, ego, flow = loader[index]
 
     pc0 = sweep0.lidar.as_tensor()
@@ -22,7 +24,7 @@ def loadAnnotation(datasetDir, dataset, split, index):
     pc1XYZ = (pc1Raw[:, :3] @ R.T) + t
     pc1 = torch.cat([pc1XYZ, pc1Raw[:, 3:]], dim=1)
 
-    return pc0, pc1, flow
+    return pc0, pc1, flow, sweep0.sweep_uuid
 
 # Vibecoded visualization because it's not that important
 def visualize(pc0, pc1, flow):
@@ -103,5 +105,6 @@ if __name__ == "__main__":
     split = "train"
     index = 0
 
-    pc0, pc1, flow = loadAnnotation(datasetDir, dataset, split, index)
+    loader = buildLoader(datasetDir, dataset, split)
+    pc0, pc1, flow, _ = loadAnnotation(loader, index)
     visualize(pc0, pc1, flow)
