@@ -7,10 +7,10 @@ if [ "$1" -eq 1 ]; then
     kubectl delete service $NAME
     kubectl delete ingress $NAME
 elif [ "$1" -eq 0 ]; then
-    kubectl create -f pvc.yml
-    kubectl create -f cache.yml
+    #kubectl create -f pvc.yml
+    #kubectl create -f cache.yml
     kubectl create -f desktop.yml
-    kubectl create -f desktop-ingress.yml
+    #kubectl create -f desktop-ingress.yml
 elif [ "$1" -eq 2 ]; then
     kubectl delete deployment $NAME
     kubectl delete service $NAME

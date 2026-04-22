@@ -1,4 +1,5 @@
-The AIEA lab @ UCSC for the Lidar Scene Flow 2026 challenge
+The AIEA lab @ UCSC for the Lidar Scene Flow 2026 challenge 
+
 # Access the Nautilus PVCs by running
 ```
 sh setup.sh 0
@@ -9,6 +10,12 @@ sh setup.sh 1
 ```
 
 The datasets are stored in an 8TB pvc called 'lidarflow' in the aiea-slugbotics namespace
+
+In the PVC run:
+```
+. start.sh
+```
+to set up the necessary environments for development/training
 
 # Dataset
 The datasets can be downloaded with the shell script in ```/downloadDataset```
