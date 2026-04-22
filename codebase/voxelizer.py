@@ -40,7 +40,7 @@ def voxelize(points, voxelSize, pointRange):
     xCoord = uniqueFlat // (Dy * Dz)
     coords = torch.stack([xCoord, yCoord, zCoord], dim=1).to(torch.int32)
  
-    return features, coords, spatialShape
+    return features, coords, spatialShape, inverse, inRangeMask
 
 
 def saveBevPng(coords, spatialShape, voxelSize, pointRange, outPath):
@@ -91,7 +91,7 @@ if __name__ == '__main__':
  
     print(f'input points: {points.shape}, dtype={points.dtype}')
  
-    features, coords, spatialShape = voxelize(points, voxelSize, pointRange)
+    features, coords, spatialShape, _, _ = voxelize(points, voxelSize, pointRange)
  
     print(f'spatial shape (Dx, Dy, Dz): {spatialShape.tolist()}')
     print(f'occupied voxels: {features.shape[0]}')
