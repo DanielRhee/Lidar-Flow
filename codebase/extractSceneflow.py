@@ -1,8 +1,4 @@
 import torch
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from av2.torch.data_loaders.scene_flow import SceneFlowDataloader
 from pathlib import Path
 
@@ -30,6 +26,10 @@ def loadAnnotation(datasetDir, dataset, split, index):
 
 # Vibecoded visualization because it's not that important
 def visualize(pc0, pc1, flow):
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
     def to_np(t):
         return t.detach().cpu().float().numpy()
 
