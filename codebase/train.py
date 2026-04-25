@@ -10,8 +10,11 @@ from model import SparseFlowNet, runForward
 
 
 def epeLoss(pred, gt, valid):
-    err = (pred - gt).norm(dim=1)
-    return err[valid].mean()
+    err = (pred - gt).pow(2).sum(dim=1).clamp(min=1e-8).sqrt()
+    validErr = err[valid]
+    if validErr.numel() == 0:
+        return err.sum() * 0.0
+    return validErr.mean()
 
 
 def runStep(model, sample, device, voxelSize, pointRange):
@@ -32,7 +35,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weightDecay", type=float, default=1e-4)
     parser.add_argument("--voxelSize", type=float, default=0.2)
-    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--outDir", type=Path, default=Path("runs/mvp"))
     args = parser.parse_args()
 
