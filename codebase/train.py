@@ -25,6 +25,57 @@ def runStep(model, sample, device, voxelSize, pointRange):
     return epeLoss(pred, gt, valid)
 
 
+def saveCheckpoint(path, model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args):
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "globalStep": globalStep,
+            "bestVal": bestVal,
+            "valEpe": valEpe,
+            "args": vars(args),
+            "rngState": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all(),
+            },
+        },
+        path,
+    )
+
+
+def resolveResumePath(resumeArg, outDir):
+    if resumeArg is None:
+        return None
+    if resumeArg != "auto":
+        p = Path(resumeArg)
+        return p if p.exists() else None
+    for candidate in [outDir / "last.pt", outDir / "step_latest.pt"]:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def loadCheckpoint(path, model, opt, sched, scaler, device):
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    opt.load_state_dict(ckpt["optimizer"])
+    sched.load_state_dict(ckpt["scheduler"])
+    scaler.load_state_dict(ckpt["scaler"])
+    rng = ckpt.get("rngState", {})
+    if "torch" in rng:
+        torch.set_rng_state(rng["torch"])
+    if "cuda" in rng:
+        torch.cuda.set_rng_state_all(rng["cuda"])
+    startEpoch = ckpt["epoch"] + 1
+    globalStep = ckpt.get("globalStep", 0)
+    bestVal = ckpt.get("bestVal", float("inf"))
+    print(f"resumed from {path} at epoch {startEpoch}, bestVal {bestVal:.4f}")
+    return startEpoch, globalStep, bestVal
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasetDir", type=Path, default=Path.home() / "persistent")
@@ -37,6 +88,9 @@ def main():
     parser.add_argument("--voxelSize", type=float, default=0.2)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--outDir", type=Path, default=Path("runs/mvp"))
+    parser.add_argument("--resume", type=str, default=None, metavar="PATH|auto")
+    parser.add_argument("--checkpointEveryEpochs", type=int, default=5)
+    parser.add_argument("--checkpointEverySteps", type=int, default=500)
     args = parser.parse_args()
 
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
@@ -56,8 +110,15 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs * len(trainDl), 1))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
+    startEpoch = 0
+    globalStep = 0
     bestVal = float("inf")
-    for epoch in range(args.epochs):
+
+    resumePath = resolveResumePath(args.resume, args.outDir)
+    if resumePath is not None:
+        startEpoch, globalStep, bestVal = loadCheckpoint(resumePath, model, opt, sched, scaler, device)
+
+    for epoch in range(startEpoch, args.epochs):
         model.train()
         trainSum, trainN = 0.0, 0
         t0 = time.time()
@@ -73,6 +134,13 @@ def main():
             sched.step()
             trainSum += loss.item()
             trainN += 1
+            globalStep += 1
+
+            if args.checkpointEverySteps > 0 and globalStep % args.checkpointEverySteps == 0:
+                saveCheckpoint(
+                    args.outDir / "step_latest.pt",
+                    model, opt, sched, scaler, epoch, globalStep, bestVal, float("nan"), args,
+                )
 
         model.eval()
         valSum, valN = 0.0, 0
@@ -88,15 +156,16 @@ def main():
         dt = time.time() - t0
         print(f"epoch {epoch}: trainEPE={trainEpe:.4f}  valEPE={valEpe:.4f}  dt={dt:.1f}s")
 
-        torch.save(
-            {"model": model.state_dict(), "epoch": epoch, "valEpe": valEpe, "args": vars(args)},
-            args.outDir / "last.pt",
-        )
+        saveCheckpoint(args.outDir / "last.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
+
         if valEpe < bestVal:
             bestVal = valEpe
-            torch.save(
-                {"model": model.state_dict(), "epoch": epoch, "valEpe": valEpe, "args": vars(args)},
-                args.outDir / "best.pt",
+            saveCheckpoint(args.outDir / "best.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
+
+        if args.checkpointEveryEpochs > 0 and (epoch + 1) % args.checkpointEveryEpochs == 0:
+            saveCheckpoint(
+                args.outDir / f"epoch_{epoch}.pt",
+                model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args,
             )
 
     print(f"best valEPE: {bestVal:.4f}")
