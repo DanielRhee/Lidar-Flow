@@ -1,4 +1,5 @@
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -17,12 +18,21 @@ def epeLoss(pred, gt, valid):
     return validErr.mean()
 
 
-def runStep(model, sample, device, voxelSize, pointRange):
+def runStep(model, sample, device, voxelSize, pointRange, returnDynamic=False):
     pc0, pc1, flow, _ = sample
     pred, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
     gt = flow.flow.to(device)[mask0]
     valid = flow.is_valid.to(device)[mask0]
-    return epeLoss(pred, gt, valid)
+    loss = epeLoss(pred, gt, valid)
+    if not returnDynamic:
+        return loss
+    dyn = flow.is_dynamic.to(device)[mask0]
+    dynValid = valid & dyn
+    if dynValid.any():
+        dynLoss = epeLoss(pred, gt, dynValid)
+    else:
+        dynLoss = torch.tensor(float("nan"), device=device)
+    return loss, dynLoss
 
 
 def saveCheckpoint(path, model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args):
@@ -97,10 +107,13 @@ def main():
     device = torch.device("cuda")
     args.outDir.mkdir(parents=True, exist_ok=True)
 
+    random.seed(0)
     trainBase = SceneFlowDataset(args.datasetDir, args.dataset, "train")
     valBase = SceneFlowDataset(args.datasetDir, args.dataset, "val")
-    trainDs = Subset(trainBase, list(range(min(args.trainSamples, len(trainBase)))))
-    valDs = Subset(valBase, list(range(min(args.valSamples, len(valBase)))))
+    trainIdx = random.sample(range(len(trainBase)), min(args.trainSamples, len(trainBase)))
+    valIdx = random.sample(range(len(valBase)), min(args.valSamples, len(valBase)))
+    trainDs = Subset(trainBase, trainIdx)
+    valDs = Subset(valBase, valIdx)
 
     trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=0, collate_fn=identityCollate)
     valDl = DataLoader(valDs, batch_size=1, shuffle=False, num_workers=0, collate_fn=identityCollate)
@@ -143,18 +156,22 @@ def main():
                 )
 
         model.eval()
-        valSum, valN = 0.0, 0
+        valSum, valDynSum, valN, valDynN = 0.0, 0.0, 0, 0
         with torch.no_grad():
             for sample in valDl:
                 with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
-                    loss = runStep(model, sample, device, args.voxelSize, pointRange)
+                    loss, dynLoss = runStep(model, sample, device, args.voxelSize, pointRange, returnDynamic=True)
                 valSum += loss.item()
                 valN += 1
+                if not torch.isnan(dynLoss):
+                    valDynSum += dynLoss.item()
+                    valDynN += 1
 
         trainEpe = trainSum / max(trainN, 1)
         valEpe = valSum / max(valN, 1)
+        valDynEpe = valDynSum / max(valDynN, 1)
         dt = time.time() - t0
-        print(f"epoch {epoch}: trainEPE={trainEpe:.4f}  valEPE={valEpe:.4f}  dt={dt:.1f}s")
+        print(f"epoch {epoch}: trainEPE={trainEpe:.4f}  valEPE={valEpe:.4f}  valDynEPE={valDynEpe:.4f}  dt={dt:.1f}s")
 
         saveCheckpoint(args.outDir / "last.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
 
