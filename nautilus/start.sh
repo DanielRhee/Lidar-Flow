@@ -19,5 +19,9 @@ BASHRC
 
 conda activate lidarflow
 
+python -m pip intall torch
+python -m pip install av2
+
+
 sudo apt update
 sudo apt-get install screen
