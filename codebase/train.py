@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from dataset import SceneFlowDataset, identityCollate
+from dataset import DiskCachedDataset, identityCollate
 from model import SparseFlowNet, runForward
 
 
@@ -108,15 +108,18 @@ def main():
     args.outDir.mkdir(parents=True, exist_ok=True)
 
     random.seed(0)
-    trainBase = SceneFlowDataset(args.datasetDir, args.dataset, "train")
-    valBase = SceneFlowDataset(args.datasetDir, args.dataset, "val")
+    cacheDir = Path("/tmp/lidarflow_cache")
+    trainBase = DiskCachedDataset(args.datasetDir, args.dataset, "train", cacheDir)
+    valBase = DiskCachedDataset(args.datasetDir, args.dataset, "val", cacheDir)
     trainIdx = random.sample(range(len(trainBase)), min(args.trainSamples, len(trainBase)))
     valIdx = random.sample(range(len(valBase)), min(args.valSamples, len(valBase)))
     trainDs = Subset(trainBase, trainIdx)
     valDs = Subset(valBase, valIdx)
 
-    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=0, collate_fn=identityCollate)
-    valDl = DataLoader(valDs, batch_size=1, shuffle=False, num_workers=0, collate_fn=identityCollate)
+    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=4,
+                         persistent_workers=True, pin_memory=True, collate_fn=identityCollate)
+    valDl = DataLoader(valDs, batch_size=1, shuffle=False, num_workers=2,
+                       persistent_workers=True, pin_memory=True, collate_fn=identityCollate)
 
     model = SparseFlowNet(inC=10).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weightDecay)
