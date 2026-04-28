@@ -21,6 +21,7 @@ conda activate lidarflow
 
 python -m pip intall torch
 python -m pip install av2
+python -m pip install spconv
 
 
 sudo apt update
