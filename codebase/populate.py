@@ -18,6 +18,7 @@ def populate(split, indices, loader, cacheDir, numThreads):
     todo = [i for i in indices if not (splitCache / f"{i}.pt").exists()]
     cached = len(indices) - len(todo)
     if not todo:
+        print("FAIL")
         # cancel
         return
 
@@ -71,7 +72,7 @@ def populate(split, indices, loader, cacheDir, numThreads):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasetDir", type=Path, default=Path.home() / "persistent")
-    parser.add_argument("--dataset", default="data")
+    parser.add_argument("--dataset", default="dataset")
     parser.add_argument(
         "--cacheDir",
         type=Path,
