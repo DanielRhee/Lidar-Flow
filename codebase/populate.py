@@ -1,5 +1,6 @@
 import argparse
 import gc
+import json
 import random
 import statistics
 import threading
@@ -92,6 +93,7 @@ def main():
         tBuild = time.time()
         trainLoader = buildLoader(args.datasetDir, args.dataset, "train")
         trainIdx = random.sample(range(len(trainLoader)), min(args.trainSamples, len(trainLoader)))
+        (Path(args.cacheDir) / "train_indices.json").write_text(json.dumps(trainIdx))
         populate("train", trainIdx, trainLoader, args.cacheDir, args.numThreads)
         del trainLoader
         gc.collect()
@@ -101,6 +103,7 @@ def main():
         tBuild = time.time()
         valLoader = buildLoader(args.datasetDir, args.dataset, "val")
         valIdx = random.sample(range(len(valLoader)), min(args.valSamples, len(valLoader)))
+        (Path(args.cacheDir) / "val_indices.json").write_text(json.dumps(valIdx))
         populate("val", valIdx, valLoader, args.cacheDir, args.numThreads)
         del valLoader
         gc.collect()

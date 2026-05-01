@@ -1,5 +1,5 @@
 import argparse
-import random
+import json
 import time
 from pathlib import Path
 
@@ -89,9 +89,9 @@ def loadCheckpoint(path, model, opt, sched, scaler, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasetDir", type=Path, default=Path.home() / "persistent")
-    parser.add_argument("--dataset", default="data")
-    parser.add_argument("--trainSamples", type=int, default=1000)
-    parser.add_argument("--valSamples", type=int, default=200)
+    parser.add_argument("--dataset", default="dataset")
+    parser.add_argument("--cacheDir", type=Path,
+                        default=Path.home() / "persistent" / "djrhee" / "lidarflow_cache")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weightDecay", type=float, default=1e-4)
@@ -107,12 +107,11 @@ def main():
     device = torch.device("cuda")
     args.outDir.mkdir(parents=True, exist_ok=True)
 
-    random.seed(0)
-    cacheDir = Path("/tmp/lidarflow_cache")
+    cacheDir = args.cacheDir
     trainBase = DiskCachedDataset(args.datasetDir, args.dataset, "train", cacheDir)
     valBase = DiskCachedDataset(args.datasetDir, args.dataset, "val", cacheDir)
-    trainIdx = random.sample(range(len(trainBase)), min(args.trainSamples, len(trainBase)))
-    valIdx = random.sample(range(len(valBase)), min(args.valSamples, len(valBase)))
+    trainIdx = json.loads((cacheDir / "train_indices.json").read_text())
+    valIdx = json.loads((cacheDir / "val_indices.json").read_text())
     trainDs = Subset(trainBase, trainIdx)
     valDs = Subset(valBase, valIdx)
 
