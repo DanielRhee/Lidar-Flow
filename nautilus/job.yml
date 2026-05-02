@@ -1,0 +1,72 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: djrhee-lidarflow-train
+  namespace: gilpin-lab
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: djrhee-lidarflow-train
+        image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          set -e
+          . ~/persistent/start.sh || true
+          source ~/miniconda3/etc/profile.d/conda.sh
+
+          if ! conda env list | grep -q "^lidarflow "; then
+            conda config --add channels conda-forge
+            conda env create -f ~/persistent/python/lidarflow.yml --name lidarflow
+          fi
+
+          cd ~/persistent/djrhee/Lidar-Flow
+          git checkout -- .
+          git pull
+
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          conda run -n lidarflow python codebase/train.py \
+            --trainSamples 200 \
+            --valSamples 50 \
+            --epochs 3 \
+            --outDir ~/persistent/djrhee/Lidar-Flow/runs/run_${TIMESTAMP} \
+            --cacheDir ~/persistent/djrhee/lidarflow_cache
+        resources:
+          limits:
+            memory: 14Gi
+            cpu: "14"
+            nvidia.com/gpu: "0"
+            ephemeral-storage: 20Gi
+          requests:
+            memory: 12Gi
+            cpu: "12"
+            nvidia.com/gpu: "0"
+            ephemeral-storage: 12Gi
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /home/ubuntu/persistent
+          name: root-vol
+      dnsPolicy: None
+      dnsConfig:
+        nameservers:
+        - 8.8.8.8
+        - 8.8.4.4
+      volumes:
+      - name: dshm
+        emptyDir: {}
+      - name: root-vol
+        persistentVolumeClaim:
+          claimName: lidarflow-challenge
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: NotIn
+                values:
+                - ucsd-suncave
