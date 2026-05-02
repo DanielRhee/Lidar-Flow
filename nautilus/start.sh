@@ -19,9 +19,9 @@ BASHRC
 
 conda activate lidarflow
 
-python -m pip intall torch
-python -m pip install av2
-python -m pip install spconv-cu120
+conda run -n lidarflow python -m pip install torch
+conda run -n lidarflow python -m pip install av2
+conda run -n lidarflow python -m pip install spconv-cu120
 
 sudo apt update
-sudo apt-get install screen
+#sudo apt-get install screen
