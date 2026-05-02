@@ -12,11 +12,15 @@ elif [ "$1" -eq 0 ]; then
     kubectl create -f desktop.yml
     #kubectl create -f desktop-ingress.yml
 elif [ "$1" -eq 2 ]; then
-    kubectl delete deployment $NAME
-    kubectl delete service $NAME
-    kubectl delete ingress $NAME
-    kubectl delete pvc --now $POD_NAME
-    kubectl delete pvc --now $CACHE_NAME
+    #kubectl delete deployment $NAME
+    #kubectl delete service $NAME
+    #kubectl delete ingress $NAME
+    #kubectl delete pvc --now $POD_NAME
+    #kubectl delete pvc --now $CACHE_NAME
+elif [ "$1" -eq 3 ]; then
+    kubectl create -f job.yml -n gilpin-lab
+elif [ "$1" -eq 4 ]; then
+    kubectl delete job djrhee-lidarflow-train -n gilpin-lab
 else
     echo "Usage: $0 [1]"
     exit 1
