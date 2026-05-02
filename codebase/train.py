@@ -90,8 +90,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasetDir", type=Path, default=Path.home() / "persistent")
     parser.add_argument("--dataset", default="dataset")
-    parser.add_argument("--cacheDir", type=Path,
-                        default=Path.home() / "persistent" / "djrhee" / "lidarflow_cache")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weightDecay", type=float, default=1e-4)
