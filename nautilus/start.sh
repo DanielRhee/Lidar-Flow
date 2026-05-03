@@ -17,11 +17,11 @@ cat >> "$HOME/.bashrc" << 'BASHRC'
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 BASHRC
 
-conda activate lidarflow
-
 conda run -n lidarflow python -m pip install torch
 conda run -n lidarflow python -m pip install av2
 conda run -n lidarflow python -m pip install spconv-cu120
 
-sudo apt update
+conda activate lidarflow
+
+#sudo apt update
 #sudo apt-get install screen
