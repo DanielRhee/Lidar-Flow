@@ -161,6 +161,8 @@ def main():
             globalStep += 1
 
             if args.checkpointEverySteps > 0 and globalStep % args.checkpointEverySteps == 0:
+                avgLoss = trainSum / max(trainN, 1)
+                print(f"  step {globalStep} (epoch {epoch}, {trainN}/{len(trainDl)}): loss={avgLoss:.4f}", flush=True)
                 saveCheckpoint(
                     args.outDir / "step_latest.pt",
                     model, opt, sched, scaler, epoch, globalStep, bestVal, float("nan"), args,
@@ -177,7 +179,6 @@ def main():
                 if not torch.isnan(dynLoss):
                     valDynSum += dynLoss.item()
                     valDynN += 1
-            print("Sample done")
 
         trainEpe = trainSum / max(trainN, 1)
         valEpe = valSum / max(valN, 1)
