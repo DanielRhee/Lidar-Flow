@@ -11,7 +11,7 @@ elif [ "$1" -eq 0 ]; then
     #kubectl create -f cache.yml
     kubectl create -f desktop.yml
     #kubectl create -f desktop-ingress.yml
-elif [ "$1" -eq 2 ]; then
+#elif [ "$1" -eq 2 ]; then
     #kubectl delete deployment $NAME
     #kubectl delete service $NAME
     #kubectl delete ingress $NAME

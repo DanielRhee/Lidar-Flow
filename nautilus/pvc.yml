@@ -1,11 +1,12 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: lidarflow
+  name: lidarflow-challenge
 spec:
-  storageClassName: rook-ceph-block
   accessModes:
-  - ReadWriteOnce
+    - ReadWriteMany
+  storageClassName: rook-cephfs
   resources:
     requests:
-      storage: 1.5Ti
+      storage: 8Ti
+  volumeMode: Filesystem
