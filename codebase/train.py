@@ -177,6 +177,7 @@ def main():
                 if not torch.isnan(dynLoss):
                     valDynSum += dynLoss.item()
                     valDynN += 1
+            print("Sample done")
 
         trainEpe = trainSum / max(trainN, 1)
         valEpe = valSum / max(valN, 1)
@@ -200,4 +201,5 @@ def main():
 
 
 if __name__ == "__main__":
+    print("Starting...")
     main()
