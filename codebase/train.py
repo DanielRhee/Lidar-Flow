@@ -11,7 +11,7 @@ from model import SparseFlowNet, runForward
 
 
 def epeLoss(pred, gt, valid):
-    err = (pred - gt).pow(2).sum(dim=1).clamp(min=1e-8).sqrt()
+    err = (pred - gt).pow(2).sum(dim=1).clamp(min=1e-6).sqrt()
     validErr = err[valid]
     if validErr.numel() == 0:
         return err.sum() * 0.0
@@ -70,7 +70,11 @@ def resolveResumePath(resumeArg, outDir):
 
 def loadCheckpoint(path, model, opt, sched, scaler, device):
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
+    for m in model.modules():
+        if isinstance(m, torch.nn.GroupNorm):
+            torch.nn.init.ones_(m.weight)
+            torch.nn.init.zeros_(m.bias)
     opt.load_state_dict(ckpt["optimizer"])
     sched.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
@@ -150,6 +154,9 @@ def main():
             opt.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
                 loss = runStep(model, sample, device, args.voxelSize, pointRange)
+            if not torch.isfinite(loss):
+                globalStep += 1
+                continue
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

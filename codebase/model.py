@@ -36,10 +36,10 @@ def buildUnion(f0, c0, f1, c1):
 def subMBlock(inC, outC, key):
     return spconv.SparseSequential(
         spconv.SubMConv3d(inC, outC, 3, padding=1, bias=False, indice_key=key),
-        nn.BatchNorm1d(outC),
+        nn.GroupNorm(num_groups=8, num_channels=outC),
         nn.ReLU(True),
         spconv.SubMConv3d(outC, outC, 3, padding=1, bias=False, indice_key=key),
-        nn.BatchNorm1d(outC),
+        nn.GroupNorm(num_groups=8, num_channels=outC),
         nn.ReLU(True),
     )
 
@@ -47,7 +47,7 @@ def subMBlock(inC, outC, key):
 def downBlock(inC, outC, key):
     return spconv.SparseSequential(
         spconv.SparseConv3d(inC, outC, 3, stride=2, padding=1, bias=False, indice_key=key),
-        nn.BatchNorm1d(outC),
+        nn.GroupNorm(num_groups=8, num_channels=outC),
         nn.ReLU(True),
     )
 
@@ -55,7 +55,7 @@ def downBlock(inC, outC, key):
 def upBlock(inC, outC, key):
     return spconv.SparseSequential(
         spconv.SparseInverseConv3d(inC, outC, 3, bias=False, indice_key=key),
-        nn.BatchNorm1d(outC),
+        nn.GroupNorm(num_groups=8, num_channels=outC),
         nn.ReLU(True),
     )
 
