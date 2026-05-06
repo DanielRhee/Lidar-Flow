@@ -1,3 +1,6 @@
+import faulthandler
+faulthandler.enable()
+
 import argparse
 import json
 import time
@@ -109,6 +112,12 @@ def main():
 
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
     device = torch.device("cuda")
+    import spconv.pytorch as spconv
+    print(
+        f"torch={torch.__version__} cuda={torch.version.cuda} "
+        f"sm={torch.cuda.get_device_capability()} spconv={spconv.__version__}",
+        flush=True,
+    )
     args.outDir.mkdir(parents=True, exist_ok=True)
 
     cacheDir = args.cacheDir
@@ -124,7 +133,7 @@ def main():
     trainDs = Subset(trainBase, trainIdx)
     valDs = Subset(valBase, valIdx)
 
-    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=4,
+    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=2,
                          persistent_workers=True, pin_memory=True, collate_fn=identityCollate)
     valDl = DataLoader(valDs, batch_size=1, shuffle=False, num_workers=2,
                        persistent_workers=True, pin_memory=True, collate_fn=identityCollate)
