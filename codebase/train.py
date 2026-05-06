@@ -71,11 +71,16 @@ def resolveResumePath(resumeArg, outDir):
 def loadCheckpoint(path, model, opt, sched, scaler, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"], strict=False)
+    gnParams = []
     for m in model.modules():
         if isinstance(m, torch.nn.GroupNorm):
             torch.nn.init.ones_(m.weight)
             torch.nn.init.zeros_(m.bias)
+            gnParams.extend([m.weight, m.bias])
     opt.load_state_dict(ckpt["optimizer"])
+    for p in gnParams:
+        if p in opt.state:
+            opt.state[p] = {}
     sched.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
     rng = ckpt.get("rngState", {})
