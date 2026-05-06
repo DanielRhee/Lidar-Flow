@@ -43,13 +43,13 @@ spec:
             --cacheDir ~/persistent/djrhee/lidarflow_cache
         resources:
           limits:
-            memory: 4Gi
-            cpu: "5"
+            memory: 12Gi
+            cpu: "8"
             nvidia.com/gpu: "1"
             ephemeral-storage: 20Gi
           requests:
-            memory: 4Gi
-            cpu: "5"
+            memory: 12Gi
+            cpu: "8"
             nvidia.com/gpu: "1"
             ephemeral-storage: 12Gi
         volumeMounts:
