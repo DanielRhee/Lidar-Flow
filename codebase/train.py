@@ -118,10 +118,6 @@ def main():
         f"sm={torch.cuda.get_device_capability()} spconv={spconv.__version__}",
         flush=True,
     )
-    import spconv.pytorch.conv as _cm
-    import spconv.core_cc.csrc.sparse.convops.spops as _spops
-    print("spops:", sorted(dir(_spops)), flush=True)
-    print("conv algo names:", sorted(a for a in dir(_cm) if "lgo" in a), flush=True)
     args.outDir.mkdir(parents=True, exist_ok=True)
 
     cacheDir = args.cacheDir

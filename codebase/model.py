@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
+from spconv.pytorch.conv import ConvAlgo
 
 from voxelizer import voxelize
 
-_ALGO = None
+# V100 (sm_70) and older: cumm's implicit_gemm tile selection SIGFPEs; use native rule-book path.
+_ALGO = ConvAlgo.Native if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8 else None
 
 
 # Voxel-union early fusion. f0, f1: [V, 4]  c0, c1: [V, 3] int32 (x, y, z order).
