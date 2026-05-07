@@ -1,13 +1,10 @@
 import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
-from spconv.core_cc.csrc.sparse.convops.spops import ConvAlgo
 
 from voxelizer import voxelize
 
-# V100 (sm_70) and older GPUs SIGFPE inside cumm's implicit_gemm; force the
-# native rule-book path on anything below sm_80.
-_ALGO = ConvAlgo.Native if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8 else None
+_ALGO = None
 
 
 # Voxel-union early fusion. f0, f1: [V, 4]  c0, c1: [V, 3] int32 (x, y, z order).
