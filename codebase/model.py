@@ -1,8 +1,13 @@
 import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
+from spconv.core_cc.csrc.sparse.convops.spops import ConvAlgo
 
 from voxelizer import voxelize
+
+# V100 (sm_70) and older GPUs SIGFPE inside cumm's implicit_gemm; force the
+# native rule-book path on anything below sm_80.
+_ALGO = ConvAlgo.Native if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8 else None
 
 
 # Voxel-union early fusion. f0, f1: [V, 4]  c0, c1: [V, 3] int32 (x, y, z order).
@@ -35,10 +40,10 @@ def buildUnion(f0, c0, f1, c1):
 
 def subMBlock(inC, outC, key):
     return spconv.SparseSequential(
-        spconv.SubMConv3d(inC, outC, 3, padding=1, bias=False, indice_key=key),
+        spconv.SubMConv3d(inC, outC, 3, padding=1, bias=False, indice_key=key, algo=_ALGO),
         nn.BatchNorm1d(outC),
         nn.ReLU(True),
-        spconv.SubMConv3d(outC, outC, 3, padding=1, bias=False, indice_key=key),
+        spconv.SubMConv3d(outC, outC, 3, padding=1, bias=False, indice_key=key, algo=_ALGO),
         nn.BatchNorm1d(outC),
         nn.ReLU(True),
     )
@@ -46,7 +51,7 @@ def subMBlock(inC, outC, key):
 
 def downBlock(inC, outC, key):
     return spconv.SparseSequential(
-        spconv.SparseConv3d(inC, outC, 3, stride=2, padding=1, bias=False, indice_key=key),
+        spconv.SparseConv3d(inC, outC, 3, stride=2, padding=1, bias=False, indice_key=key, algo=_ALGO),
         nn.BatchNorm1d(outC),
         nn.ReLU(True),
     )
@@ -54,7 +59,7 @@ def downBlock(inC, outC, key):
 
 def upBlock(inC, outC, key):
     return spconv.SparseSequential(
-        spconv.SparseInverseConv3d(inC, outC, 3, bias=False, indice_key=key),
+        spconv.SparseInverseConv3d(inC, outC, 3, bias=False, indice_key=key, algo=_ALGO),
         nn.BatchNorm1d(outC),
         nn.ReLU(True),
     )
@@ -82,7 +87,7 @@ class SparseFlowNet(nn.Module):
         self.dec1 = subMBlock(128, 64, "s1")
         self.up1 = upBlock(64, 32, "d1")
         self.dec0 = subMBlock(64, 32, "s0")
-        self.head = spconv.SubMConv3d(32, 3, 1, bias=True, indice_key="head")
+        self.head = spconv.SubMConv3d(32, 3, 1, bias=True, indice_key="head", algo=_ALGO)
 
     def forward(self, x):
         e0 = self.enc0(x)
