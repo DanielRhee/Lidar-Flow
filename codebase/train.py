@@ -90,6 +90,7 @@ def loadCheckpoint(path, model, opt, sched, scaler, device):
 
 
 def main():
+    # Vibecoded the parameters. will fix late rlol. but it looks within reason.
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasetDir", type=Path, default=Path.home() / "persistent")
     parser.add_argument("--dataset", default="dataset")

@@ -5,12 +5,11 @@ from spconv.pytorch.conv import ConvAlgo
 
 from voxelizer import voxelize
 
-# V100 (sm_70) and older: cumm's implicit_gemm tile selection SIGFPEs; use native rule-book path.
+# Allegedly fixes cuda versioning issues (according to gpt)
 _ALGO = ConvAlgo.Native if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 8 else None
 
 
-# Voxel-union early fusion. f0, f1: [V, 4]  c0, c1: [V, 3] int32 (x, y, z order).
-# Returns fu [Vu, 10] = [f0-or-zeros, occ0, f1-or-zeros, occ1], cu [Vu, 3], pc0ToUnion [V0].
+# Voxel combining/fusion stuff
 def buildUnion(f0, c0, f1, c1):
     device = f0.device
     base = 4096
@@ -63,8 +62,7 @@ def upBlock(inC, outC, key):
     )
 
 
-# Concat features of two sparse tensors that share coords and row order (guaranteed
-# by indice_key round-trips in the U-Net).
+# Concat sparse tensors
 def catSparse(a, b):
     return a.replace_feature(torch.cat([a.features, b.features], dim=1))
 
@@ -98,15 +96,14 @@ class SparseFlowNet(nn.Module):
         return self.head(d0)
 
 
-# Normalize intensity roughly to XYZ scale. Handles both uint8 [0,255] and [0,1] inputs.
+# Normalize intensity of the data 
 def normalizeIntensity(col):
     if col.numel() == 0:
         return col
     return col / torch.where(col.max() > 2.0, col.new_tensor(255.0), col.new_tensor(1.0))
 
 
-# End-to-end: voxelize both sweeps, build union, run the network, gather per-point flow.
-# Returns predPerPoint [N_inrange, 3] and inRangeMask0 [N].
+# end to end part that gets per point flow and runs everything above 
 def runForward(model, pc0, pc1, voxelSize, pointRange, device):
     pc0 = pc0[:, :4].to(device=device, dtype=torch.float32, non_blocking=True)
     pc1 = pc1[:, :4].to(device=device, dtype=torch.float32, non_blocking=True)
@@ -118,7 +115,7 @@ def runForward(model, pc0, pc1, voxelSize, pointRange, device):
 
     fu, cu, pc0ToUnion = buildUnion(f0, c0, f1, c1)
 
-    # spconv indices: [batch, z, y, x] int32
+    # indexed [batch, z, y, x] they r int32
     Vu = cu.shape[0]
     batchCol = torch.zeros((Vu, 1), dtype=torch.int32, device=device)
     idxZyx = torch.stack([cu[:, 2], cu[:, 1], cu[:, 0]], dim=1)
@@ -134,7 +131,7 @@ def runForward(model, pc0, pc1, voxelSize, pointRange, device):
     )
 
     out = model(x)
-    assert out.features.shape[0] == Vu, "spconv did not preserve union voxel ordering"
+    assert out.features.shape[0] == Vu, "spconv did not preserve union voxel ordering" # boooo
 
     voxelFlow = out.features
     pointToUnion = pc0ToUnion[inv0Point]
