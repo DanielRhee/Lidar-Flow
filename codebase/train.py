@@ -112,7 +112,7 @@ def main():
 
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
     device = torch.device("cuda")
-    import spconv.pytorch as spconv
+    import spconv
     print(
         f"torch={torch.__version__} cuda={torch.version.cuda} "
         f"sm={torch.cuda.get_device_capability()} spconv={spconv.__version__}",
