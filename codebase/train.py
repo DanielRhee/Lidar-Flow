@@ -72,7 +72,7 @@ def resolveResumePath(resumeArg, outDir):
 
 
 def loadCheckpoint(path, model, opt, sched, scaler, device):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     opt.load_state_dict(ckpt["optimizer"])
     sched.load_state_dict(ckpt["scheduler"])
