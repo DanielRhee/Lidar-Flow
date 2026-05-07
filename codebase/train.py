@@ -79,9 +79,9 @@ def loadCheckpoint(path, model, opt, sched, scaler, device):
     scaler.load_state_dict(ckpt["scaler"])
     rng = ckpt.get("rngState", {})
     if "torch" in rng:
-        torch.set_rng_state(rng["torch"])
+        torch.set_rng_state(rng["torch"].cpu())
     if "cuda" in rng:
-        torch.cuda.set_rng_state_all(rng["cuda"])
+        torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
     startEpoch = ckpt["epoch"] + 1
     globalStep = ckpt.get("globalStep", 0)
     bestVal = ckpt.get("bestVal", float("inf"))
