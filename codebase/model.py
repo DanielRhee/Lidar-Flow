@@ -18,9 +18,8 @@ def buildUnion(f0, c0, f1, c1):
     h1 = (c1[:, 0].long() * base + c1[:, 1].long()) * base + c1[:, 2].long()
     hAll = torch.cat([h0, h1])
     cAll = torch.cat([c0, c1], dim=0)
-    _, invAll = torch.unique(hAll, return_inverse=True)
-
-    Vu = int(invAll.max().item()) + 1
+    uniq, invAll = torch.unique(hAll, return_inverse=True)
+    Vu = uniq.shape[0]
     V0 = c0.shape[0]
 
     cu = torch.zeros((Vu, 3), dtype=torch.int32, device=device)
@@ -103,16 +102,14 @@ class SparseFlowNet(nn.Module):
 def normalizeIntensity(col):
     if col.numel() == 0:
         return col
-    if col.max() > 2.0:
-        return col / 255.0
-    return col
+    return col / torch.where(col.max() > 2.0, col.new_tensor(255.0), col.new_tensor(1.0))
 
 
 # End-to-end: voxelize both sweeps, build union, run the network, gather per-point flow.
 # Returns predPerPoint [N_inrange, 3] and inRangeMask0 [N].
 def runForward(model, pc0, pc1, voxelSize, pointRange, device):
-    pc0 = pc0[:, :4].to(device).float()
-    pc1 = pc1[:, :4].to(device).float()
+    pc0 = pc0[:, :4].to(device=device, dtype=torch.float32, non_blocking=True)
+    pc1 = pc1[:, :4].to(device=device, dtype=torch.float32, non_blocking=True)
     pc0[:, 3] = normalizeIntensity(pc0[:, 3])
     pc1[:, 3] = normalizeIntensity(pc1[:, 3])
 
@@ -127,7 +124,7 @@ def runForward(model, pc0, pc1, voxelSize, pointRange, device):
     idxZyx = torch.stack([cu[:, 2], cu[:, 1], cu[:, 0]], dim=1)
     indices = torch.cat([batchCol, idxZyx], dim=1).contiguous()
 
-    zyxShape = [int(shape[2]), int(shape[1]), int(shape[0])]
+    zyxShape = [shape[2], shape[1], shape[0]]
 
     x = spconv.SparseConvTensor(
         features=fu,

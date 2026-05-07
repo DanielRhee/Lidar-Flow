@@ -2,12 +2,12 @@ import torch
 
 def voxelize(points, voxelSize, pointRange):
     device = points.device
-    pointRange = torch.as_tensor(pointRange, dtype=torch.float32, device=device)
+    prCpu = torch.as_tensor(pointRange, dtype=torch.float32)
+    Dx, Dy, Dz = torch.floor((prCpu[3:] - prCpu[:3]) / voxelSize).long().tolist()
+    spatialShape = (Dx, Dy, Dz)
+    pointRange = prCpu.to(device)
     rangeMin = pointRange[:3]
     rangeMax = pointRange[3:]
- 
-    spatialShape = torch.floor((rangeMax - rangeMin) / voxelSize).to(torch.long)
-    Dx, Dy, Dz = spatialShape.tolist()
  
     xyz = points[:, :3]
     intensity = points[:, 3]
@@ -44,7 +44,7 @@ def voxelize(points, voxelSize, pointRange):
 
 
 def saveBevPng(coords, spatialShape, voxelSize, pointRange, outPath):
-    bev = torch.zeros((spatialShape[0].item(), spatialShape[1].item()), dtype=torch.float32)
+    bev = torch.zeros((spatialShape[0], spatialShape[1]), dtype=torch.float32)
     bev[coords[:, 0].long().cpu(), coords[:, 1].long().cpu()] = 1.0
  
     plt.figure(figsize=(8, 8))
@@ -93,9 +93,9 @@ if __name__ == '__main__':
  
     features, coords, spatialShape, _, _ = voxelize(points, voxelSize, pointRange)
  
-    print(f'spatial shape (Dx, Dy, Dz): {spatialShape.tolist()}')
+    print(f'spatial shape (Dx, Dy, Dz): {list(spatialShape)}')
     print(f'occupied voxels: {features.shape[0]}')
-    totalVoxels = spatialShape.prod().item()
+    totalVoxels = spatialShape[0] * spatialShape[1] * spatialShape[2]
     print(f'sparsity: {100.0 * (1.0 - features.shape[0] / totalVoxels):.4f}%')
     print(f'feature stats: min={features.min().item():.4f}, max={features.max().item():.4f}, mean={features.mean().item():.4f}')
     print(f'coord bounds: x=[{coords[:,0].min().item()}, {coords[:,0].max().item()}], '

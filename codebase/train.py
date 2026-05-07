@@ -24,12 +24,12 @@ def epeLoss(pred, gt, valid):
 def runStep(model, sample, device, voxelSize, pointRange, returnDynamic=False):
     pc0, pc1, flow, _ = sample
     pred, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
-    gt = flow.flow.to(device)[mask0]
-    valid = flow.is_valid.to(device)[mask0]
+    gt = flow.flow.to(device, non_blocking=True)[mask0]
+    valid = flow.is_valid.to(device, non_blocking=True)[mask0]
     loss = epeLoss(pred, gt, valid)
     if not returnDynamic:
         return loss
-    dyn = flow.is_dynamic.to(device)[mask0]
+    dyn = flow.is_dynamic.to(device, non_blocking=True)[mask0]
     dynValid = valid & dyn
     if dynValid.any():
         dynLoss = epeLoss(pred, gt, dynValid)
@@ -112,6 +112,7 @@ def main():
 
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
     device = torch.device("cuda")
+    torch.backends.cudnn.benchmark = True
     import spconv
     print(
         f"torch={torch.__version__} cuda={torch.version.cuda} "
@@ -133,10 +134,12 @@ def main():
     trainDs = Subset(trainBase, trainIdx)
     valDs = Subset(valBase, valIdx)
 
-    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=2,
-                         persistent_workers=True, pin_memory=True, collate_fn=identityCollate)
+    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=6,
+                         persistent_workers=True, pin_memory=True, prefetch_factor=4,
+                         collate_fn=identityCollate)
     valDl = DataLoader(valDs, batch_size=1, shuffle=False, num_workers=2,
-                       persistent_workers=True, pin_memory=True, collate_fn=identityCollate)
+                       persistent_workers=True, pin_memory=True, prefetch_factor=4,
+                       collate_fn=identityCollate)
 
     model = SparseFlowNet(inC=10).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weightDecay)
@@ -153,7 +156,8 @@ def main():
 
     for epoch in range(startEpoch, args.epochs):
         model.train()
-        trainSum, trainN = 0.0, 0
+        trainSumDev = torch.zeros((), device=device)
+        trainN = 0
         t0 = time.time()
         for sample in trainDl:
             opt.zero_grad(set_to_none=True)
@@ -165,12 +169,12 @@ def main():
             scaler.step(opt)
             scaler.update()
             sched.step()
-            trainSum += loss.item()
+            trainSumDev += loss.detach()
             trainN += 1
             globalStep += 1
 
             if args.checkpointEverySteps > 0 and globalStep % args.checkpointEverySteps == 0:
-                avgLoss = trainSum / max(trainN, 1)
+                avgLoss = trainSumDev.item() / max(trainN, 1)
                 print(f"  step {globalStep} (epoch {epoch}, {trainN}/{len(trainDl)}): loss={avgLoss:.4f}", flush=True)
                 saveCheckpoint(
                     args.outDir / "step_latest.pt",
@@ -189,7 +193,7 @@ def main():
                     valDynSum += dynLoss.item()
                     valDynN += 1
 
-        trainEpe = trainSum / max(trainN, 1)
+        trainEpe = trainSumDev.item() / max(trainN, 1)
         valEpe = valSum / max(valN, 1)
         valDynEpe = valDynSum / max(valDynN, 1)
         dt = time.time() - t0
