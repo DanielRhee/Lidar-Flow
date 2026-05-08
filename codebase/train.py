@@ -165,8 +165,13 @@ def main():
         t0 = time.time()
         for sample in trainDl:
             opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp):
+            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
                 loss = runStep(model, sample, device, args.voxelSize, pointRange)
+            if not torch.isfinite(loss):
+                for m in model.modules():
+                    if isinstance(m, torch.nn.BatchNorm1d):
+                        m.reset_running_stats()
+                continue
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -189,7 +194,7 @@ def main():
         valSum, valDynSum, valN, valDynN = 0.0, 0.0, 0, 0
         with torch.no_grad():
             for sample in valDl:
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp):
+                with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
                     loss, dynLoss = runStep(model, sample, device, args.voxelSize, pointRange, returnDynamic=True)
                 valSum += loss.item()
                 valN += 1
