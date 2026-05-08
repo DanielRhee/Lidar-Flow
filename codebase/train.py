@@ -14,7 +14,7 @@ from model import SparseFlowNet, runForward
 
 
 def epeLoss(pred, gt, valid):
-    err = (pred - gt).pow(2).sum(dim=1).clamp(min=1e-8).sqrt()
+    err = torch.linalg.vector_norm(pred.float() - gt.float(), dim=1)
     validErr = err[valid]
     if validErr.numel() == 0:
         return err.sum() * 0.0
@@ -74,6 +74,9 @@ def resolveResumePath(resumeArg, outDir):
 def loadCheckpoint(path, model, opt, sched, scaler, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
+    for m in model.modules():
+        if isinstance(m, torch.nn.BatchNorm1d):
+            m.reset_running_stats()
     opt.load_state_dict(ckpt["optimizer"])
     sched.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
@@ -162,7 +165,7 @@ def main():
         t0 = time.time()
         for sample in trainDl:
             opt.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp):
                 loss = runStep(model, sample, device, args.voxelSize, pointRange)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -186,7 +189,7 @@ def main():
         valSum, valDynSum, valN, valDynN = 0.0, 0.0, 0, 0
         with torch.no_grad():
             for sample in valDl:
-                with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=args.amp):
                     loss, dynLoss = runStep(model, sample, device, args.voxelSize, pointRange, returnDynamic=True)
                 valSum += loss.item()
                 valN += 1
