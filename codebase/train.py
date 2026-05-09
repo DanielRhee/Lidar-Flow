@@ -196,6 +196,8 @@ def main():
             for sample in valDl:
                 with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
                     loss, dynLoss = runStep(model, sample, device, args.voxelSize, pointRange, returnDynamic=True)
+                if not torch.isfinite(loss):
+                    continue
                 valSum += loss.item()
                 valN += 1
                 if not torch.isnan(dynLoss):
