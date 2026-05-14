@@ -30,7 +30,7 @@ spec:
 
           cd ~/persistent/djrhee/Lidar-Flow
           git checkout -- .
-          git pull
+          git pull --rebase
 
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
           conda run --no-capture-output -n lidarflow python codebase/train.py \
@@ -38,9 +38,10 @@ spec:
             --valSamples 100000 \
             --epochs 2500 \
             --voxelSize 0.1 \
-            --checkpointEveryEpochs 5 \
+            --checkpointEveryEpochs 1 \
             --outDir ~/persistent/djrhee/Lidar-Flow/runs/run_${TIMESTAMP} \
-            --cacheDir ~/persistent/djrhee/lidarflow_cache
+            --cacheDir ~/persistent/djrhee/lidarflow_cache \
+            --resume ~/persistent/djrhee/Lidar-Flow/runs/run_20260504_233935/epoch_4.pt
         resources:
           limits:
             memory: 12Gi
