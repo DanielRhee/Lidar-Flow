@@ -3,6 +3,7 @@ faulthandler.enable()
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -39,21 +40,34 @@ def betaNllLoss(pred, predLogVar, gt, valid, beta=0.5):
     return validWeighted.sum() / valid.sum().clamp(min=1).float()
 
 
-def runStep(model, sample, device, voxelSize, pointRange, returnDynamic=False):
+def setTrainMode(model, phase):
+    model.train()
+    if phase != 2:
+        return
+    for name, m in model.named_modules():
+        if not name:
+            continue
+        if name.split(".")[0] not in ("head", "uncertaintyHead"):
+            m.eval()
+
+
+def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5, returnDynamic=False):
     pc0, pc1, flow, _ = sample
-    pred, _, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
+    pred, predLogVar, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
     gt = flow.flow.to(device, non_blocking=True)[mask0]
     valid = flow.is_valid.to(device, non_blocking=True)[mask0]
-    loss = epeLoss(pred, gt, valid)
-    if not returnDynamic:
-        return loss
-    dyn = flow.is_dynamic.to(device, non_blocking=True)[mask0]
-    dynValid = valid & dyn
-    if dynValid.any():
-        dynLoss = epeLoss(pred, gt, dynValid)
-    else:
-        dynLoss = torch.tensor(float("nan"), device=device)
-    return loss, dynLoss
+
+    if returnDynamic:
+        epe = epeLoss(pred, gt, valid)
+        dyn = flow.is_dynamic.to(device, non_blocking=True)[mask0]
+        dynValid = valid & dyn
+        dynEpe = epeLoss(pred, gt, dynValid) if dynValid.any() else torch.tensor(float("nan"), device=device)
+        nll = betaNllLoss(pred, predLogVar, gt, valid, beta=beta) if phase == 2 else torch.tensor(float("nan"), device=device)
+        return epe, dynEpe, nll
+
+    if phase == 2:
+        return betaNllLoss(pred, predLogVar, gt, valid, beta=beta)
+    return epeLoss(pred, gt, valid)
 
 
 def saveCheckpoint(path, model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args):
@@ -130,6 +144,14 @@ def main():
     parser.add_argument("--resume", type=str, default=None, metavar="PATH|auto")
     parser.add_argument("--checkpointEveryEpochs", type=int, default=5)
     parser.add_argument("--checkpointEverySteps", type=int, default=500)
+    parser.add_argument("--phase", type=int, choices=[1, 2], default=1,
+                        help="1 = EPE training (existing); 2 = beta-NLL uncertainty training "
+                             "(requires --phase1Ckpt; recommend --lr 1e-4)")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="beta for beta-NLL loss (phase 2 only)")
+    parser.add_argument("--phase1Ckpt", type=Path, default=None,
+                        help="phase-1 checkpoint to load weights from when --phase 2; "
+                             "strict=False so uncertaintyHead keeps its init")
     args = parser.parse_args()
 
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
@@ -164,31 +186,51 @@ def main():
                        collate_fn=identityCollate)
 
     model = SparseFlowNet(inC=10).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weightDecay)
+
+    if args.phase == 2:
+        if args.phase1Ckpt is None:
+            raise SystemExit("--phase 2 requires --phase1Ckpt PATH")
+        ckpt = torch.load(args.phase1Ckpt, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        print(f"loaded phase-1 weights from {args.phase1Ckpt}")
+        print(f"  missing keys (expected uncertaintyHead.*): {list(missing)}")
+        print(f"  unexpected keys (should be empty): {list(unexpected)}")
+        for name, p in model.named_parameters():
+            if not (name.startswith("head.") or name.startswith("uncertaintyHead.")):
+                p.requires_grad = False
+        nTrainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        nTotal = sum(p.numel() for p in model.parameters())
+        print(f"phase 2: trainable = {nTrainable} / {nTotal} ({100.0 * nTrainable / nTotal:.2f}%)")
+
+    trainableParams = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainableParams, lr=args.lr, weight_decay=args.weightDecay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs * len(trainDl), 1))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
     startEpoch = 0
     globalStep = 0
     bestVal = float("inf")
+    bestNll = float("inf")
 
     resumePath = resolveResumePath(args.resume, args.outDir)
     if resumePath is not None:
         startEpoch, globalStep, bestVal = loadCheckpoint(resumePath, model, opt, sched, scaler, device)
 
     for epoch in range(startEpoch, args.epochs):
-        model.train()
+        setTrainMode(model, args.phase)
         trainSumDev = torch.zeros((), device=device)
         trainN = 0
         t0 = time.time()
         for sample in trainDl:
             opt.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
-                loss = runStep(model, sample, device, args.voxelSize, pointRange)
+                loss = runStep(model, sample, device, args.voxelSize, pointRange,
+                               phase=args.phase, beta=args.beta)
             if not torch.isfinite(loss):
-                for m in model.modules():
-                    if isinstance(m, torch.nn.BatchNorm1d):
-                        m.reset_running_stats()
+                if args.phase == 1:
+                    for m in model.modules():
+                        if isinstance(m, torch.nn.BatchNorm1d):
+                            m.reset_running_stats()
                 continue
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -209,30 +251,46 @@ def main():
                 )
 
         model.eval()
-        valSum, valDynSum, valN, valDynN = 0.0, 0.0, 0, 0
+        valEpeSum, valDynSum, valNllSum = 0.0, 0.0, 0.0
+        valEpeN, valDynN, valNllN = 0, 0, 0
         with torch.no_grad():
             for sample in valDl:
                 with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
-                    loss, dynLoss = runStep(model, sample, device, args.voxelSize, pointRange, returnDynamic=True)
-                if not torch.isfinite(loss):
-                    continue
-                valSum += loss.item()
-                valN += 1
-                if not torch.isnan(dynLoss):
-                    valDynSum += dynLoss.item()
-                    valDynN += 1
+                    epe, dynEpe, nll = runStep(model, sample, device, args.voxelSize, pointRange,
+                                               phase=args.phase, beta=args.beta, returnDynamic=True)
+                if torch.isfinite(epe):
+                    valEpeSum += epe.item(); valEpeN += 1
+                if torch.isfinite(dynEpe):
+                    valDynSum += dynEpe.item(); valDynN += 1
+                if torch.isfinite(nll):
+                    valNllSum += nll.item(); valNllN += 1
 
-        trainEpe = trainSumDev.item() / max(trainN, 1)
-        valEpe = valSum / max(valN, 1)
+        trainLoss = trainSumDev.item() / max(trainN, 1)
+        valEpe = valEpeSum / max(valEpeN, 1)
         valDynEpe = valDynSum / max(valDynN, 1)
+        valNll = valNllSum / max(valNllN, 1) if valNllN > 0 else float("nan")
         dt = time.time() - t0
-        print(f"epoch {epoch}: trainEPE={trainEpe:.4f}  valEPE={valEpe:.4f}  valDynEPE={valDynEpe:.4f}  dt={dt:.1f}s")
+
+        if args.phase == 2:
+            print(f"epoch {epoch}: trainNLL={trainLoss:.4f}  valEPE={valEpe:.4f}  "
+                  f"valDynEPE={valDynEpe:.4f}  valNLL={valNll:.4f}  dt={dt:.1f}s")
+        else:
+            print(f"epoch {epoch}: trainEPE={trainLoss:.4f}  valEPE={valEpe:.4f}  "
+                  f"valDynEPE={valDynEpe:.4f}  dt={dt:.1f}s")
 
         saveCheckpoint(args.outDir / "last.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
 
-        if valEpe < bestVal:
-            bestVal = valEpe
-            saveCheckpoint(args.outDir / "best.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
+        if args.phase == 2:
+            if valEpe < bestVal:
+                bestVal = valEpe
+                saveCheckpoint(args.outDir / "best_epe.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
+            if not math.isnan(valNll) and valNll < bestNll:
+                bestNll = valNll
+                saveCheckpoint(args.outDir / "best_nll.pt", model, opt, sched, scaler, epoch, globalStep, bestNll, valEpe, args)
+        else:
+            if valEpe < bestVal:
+                bestVal = valEpe
+                saveCheckpoint(args.outDir / "best.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
 
         if args.checkpointEveryEpochs > 0 and (epoch + 1) % args.checkpointEveryEpochs == 0:
             saveCheckpoint(
@@ -240,7 +298,10 @@ def main():
                 model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args,
             )
 
-    print(f"best valEPE: {bestVal:.4f}")
+    if args.phase == 2:
+        print(f"best valEPE: {bestVal:.4f}  best valNLL: {bestNll:.4f}")
+    else:
+        print(f"best valEPE: {bestVal:.4f}")
 
 
 if __name__ == "__main__":
