@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
@@ -84,6 +85,13 @@ class SparseFlowNet(nn.Module):
         self.up1 = upBlock(64, 32, "d1")
         self.dec0 = subMBlock(64, 32, "s0")
         self.head = spconv.SubMConv3d(32, 3, 1, bias=True, indice_key="head", algo=_ALGO)
+        self.uncertaintyHead = nn.Sequential(
+            nn.Linear(32, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 1),
+        )
+        nn.init.zeros_(self.uncertaintyHead[2].weight)
+        nn.init.constant_(self.uncertaintyHead[2].bias, math.log(0.1))
 
     def forward(self, x):
         e0 = self.enc0(x)
@@ -93,7 +101,9 @@ class SparseFlowNet(nn.Module):
         d2 = self.dec2(catSparse(self.up3(b), e2))
         d1 = self.dec1(catSparse(self.up2(d2), e1))
         d0 = self.dec0(catSparse(self.up1(d1), e0))
-        return self.head(d0)
+        flowOut = self.head(d0)
+        logVar = torch.clamp(self.uncertaintyHead(d0.features), -10.0, 5.0)
+        return flowOut, logVar
 
 
 # Normalize intensity of the data 
@@ -130,11 +140,12 @@ def runForward(model, pc0, pc1, voxelSize, pointRange, device):
         batch_size=1,
     )
 
-    out = model(x)
+    out, logVar = model(x)
     assert out.features.shape[0] == Vu, "spconv did not preserve union voxel ordering" # boooo
 
     voxelFlow = out.features
     pointToUnion = pc0ToUnion[inv0Point]
     predPerPoint = voxelFlow[pointToUnion]
+    predLogVarPerPoint = logVar[pointToUnion].squeeze(-1)
 
-    return predPerPoint, mask0
+    return predPerPoint, predLogVarPerPoint, mask0
