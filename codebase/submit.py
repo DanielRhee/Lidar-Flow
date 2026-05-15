@@ -23,7 +23,7 @@ def loadModel(checkpointPath, device):
 @torch.no_grad()
 def predictSample(model, pc0, pc1, voxelSize, pointRange, device, amp):
     with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
-        pred, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
+        pred, _, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
 
     n = pc0.shape[0]
     fullFlow = torch.zeros((n, 3), dtype=torch.float32, device=device)

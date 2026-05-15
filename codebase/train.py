@@ -21,9 +21,27 @@ def epeLoss(pred, gt, valid):
     return validErr.mean()
 
 
+def betaNllLoss(pred, predLogVar, gt, valid, beta=0.5):
+    pred = pred.float()
+    predLogVar = predLogVar.float()
+    gt = gt.float()
+
+    sqErr = ((pred - gt) ** 2).sum(dim=1)
+    var = torch.exp(predLogVar)
+    nll = 0.5 * sqErr / var + 1.5 * predLogVar
+
+    weight = var.detach() ** beta
+    weighted = nll * weight
+
+    validWeighted = weighted[valid]
+    if validWeighted.numel() == 0:
+        return weighted.sum() * 0.0
+    return validWeighted.sum() / valid.sum().clamp(min=1).float()
+
+
 def runStep(model, sample, device, voxelSize, pointRange, returnDynamic=False):
     pc0, pc1, flow, _ = sample
-    pred, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
+    pred, _, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
     gt = flow.flow.to(device, non_blocking=True)[mask0]
     valid = flow.is_valid.to(device, non_blocking=True)[mask0]
     loss = epeLoss(pred, gt, valid)
