@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from dataset import DiskCachedDataset, identityCollate
-from model import SparseFlowNet, runForward
+from model import SparseFlowNet, runForward, runForwardFeatures, runForwardHeads
 
 
 def epeLoss(pred, gt, valid):
@@ -42,7 +42,7 @@ def betaNllLoss(pred, predLogVar, gt, valid, beta=0.5):
 
 def setTrainMode(model, phase):
     model.train()
-    if phase != 2:
+    if phase not in (2, 3):
         return
     for name, m in model.named_modules():
         if not name:
@@ -53,7 +53,15 @@ def setTrainMode(model, phase):
 
 def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5, returnDynamic=False):
     pc0, pc1, flow, _ = sample
-    pred, predLogVar, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
+
+    # phase 3 training uses partial no_grad: backbone under no_grad, heads with autograd
+    if phase == 3 and not returnDynamic:
+        with torch.no_grad():
+            d0, pc0ToUnion, inv0Point, mask0 = runForwardFeatures(model, pc0, pc1, voxelSize, pointRange, device)
+        pred, predLogVar = runForwardHeads(model, d0, pc0ToUnion, inv0Point)
+    else:
+        pred, predLogVar, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
+
     gt = flow.flow.to(device, non_blocking=True)[mask0]
     valid = flow.is_valid.to(device, non_blocking=True)[mask0]
 
@@ -62,10 +70,10 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5, ret
         dyn = flow.is_dynamic.to(device, non_blocking=True)[mask0]
         dynValid = valid & dyn
         dynEpe = epeLoss(pred, gt, dynValid) if dynValid.any() else torch.tensor(float("nan"), device=device)
-        nll = betaNllLoss(pred, predLogVar, gt, valid, beta=beta) if phase == 2 else torch.tensor(float("nan"), device=device)
+        nll = betaNllLoss(pred, predLogVar, gt, valid, beta=beta) if phase in (2, 3) else torch.tensor(float("nan"), device=device)
         return epe, dynEpe, nll
 
-    if phase == 2:
+    if phase in (2, 3):
         return betaNllLoss(pred, predLogVar, gt, valid, beta=beta)
     return epeLoss(pred, gt, valid)
 
@@ -144,14 +152,19 @@ def main():
     parser.add_argument("--resume", type=str, default=None, metavar="PATH|auto")
     parser.add_argument("--checkpointEveryEpochs", type=int, default=5)
     parser.add_argument("--checkpointEverySteps", type=int, default=500)
-    parser.add_argument("--phase", type=int, choices=[1, 2], default=1,
-                        help="1 = EPE training (existing); 2 = beta-NLL uncertainty training "
-                             "(requires --phase1Ckpt; recommend --lr 1e-4)")
+    parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=1,
+                        help="1 = EPE training; 2 = beta-NLL uncertainty-only training; "
+                             "3 = joint flow+uncertainty training (Option B)")
     parser.add_argument("--beta", type=float, default=0.5,
-                        help="beta for beta-NLL loss (phase 2 only)")
+                        help="beta for beta-NLL loss (phases 2 and 3)")
     parser.add_argument("--phase1Ckpt", type=Path, default=None,
-                        help="phase-1 checkpoint to load weights from when --phase 2; "
+                        help="checkpoint to load weights from for phases 2 and 3; "
                              "strict=False so uncertaintyHead keeps its init")
+    parser.add_argument("--flowLr", type=float, default=5e-5,
+                        help="learning rate for flow head in phase 3 (default: 5e-5)")
+    parser.add_argument("--epeBase", type=float, default=None,
+                        help="baseline val EPE for phase 3 guardrail; "
+                             "defaults to valEpe stored in --phase1Ckpt")
     args = parser.parse_args()
 
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
@@ -187,9 +200,12 @@ def main():
 
     model = SparseFlowNet(inC=10).to(device)
 
-    if args.phase == 2:
+    epeBase = None
+    consecutiveBadEpochs = 0
+
+    if args.phase in (2, 3):
         if args.phase1Ckpt is None:
-            raise SystemExit("--phase 2 requires --phase1Ckpt PATH")
+            raise SystemExit(f"--phase {args.phase} requires --phase1Ckpt PATH")
         ckpt = torch.load(args.phase1Ckpt, map_location=device, weights_only=False)
         missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
         print(f"loaded phase-1 weights from {args.phase1Ckpt}")
@@ -200,10 +216,24 @@ def main():
                 p.requires_grad = False
         nTrainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         nTotal = sum(p.numel() for p in model.parameters())
-        print(f"phase 2: trainable = {nTrainable} / {nTotal} ({100.0 * nTrainable / nTotal:.2f}%)")
+        print(f"phase {args.phase}: trainable = {nTrainable} / {nTotal} ({100.0 * nTrainable / nTotal:.2f}%)")
 
-    trainableParams = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainableParams, lr=args.lr, weight_decay=args.weightDecay)
+        if args.phase == 3:
+            epeBase = args.epeBase if args.epeBase is not None else ckpt.get("valEpe")
+            if epeBase is None or math.isnan(epeBase):
+                raise SystemExit("--phase 3 requires --epeBase or a phase1Ckpt with valEpe stored")
+            print(f"phase 3: EPE base = {epeBase:.4f}  guardrail = {1.05 * epeBase:.4f}  hard-stop = {1.10 * epeBase:.4f}")
+
+    if args.phase == 3:
+        headParams = [p for name, p in model.named_parameters() if name.startswith("head.") and p.requires_grad]
+        unchParams = [p for name, p in model.named_parameters() if name.startswith("uncertaintyHead.") and p.requires_grad]
+        opt = torch.optim.AdamW([
+            {"params": headParams, "lr": args.flowLr},
+            {"params": unchParams, "lr": args.lr},
+        ], weight_decay=args.weightDecay)
+    else:
+        trainableParams = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainableParams, lr=args.lr, weight_decay=args.weightDecay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs * len(trainDl), 1))
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
 
@@ -271,7 +301,7 @@ def main():
         valNll = valNllSum / max(valNllN, 1) if valNllN > 0 else float("nan")
         dt = time.time() - t0
 
-        if args.phase == 2:
+        if args.phase in (2, 3):
             print(f"epoch {epoch}: trainNLL={trainLoss:.4f}  valEPE={valEpe:.4f}  "
                   f"valDynEPE={valDynEpe:.4f}  valNLL={valNll:.4f}  dt={dt:.1f}s")
         else:
@@ -280,7 +310,23 @@ def main():
 
         saveCheckpoint(args.outDir / "last.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
 
-        if args.phase == 2:
+        if args.phase == 3:
+            if valEpe < bestVal:
+                bestVal = valEpe
+            if not math.isnan(valNll) and valNll < bestNll and valEpe <= 1.05 * epeBase:
+                bestNll = valNll
+                saveCheckpoint(args.outDir / "best.pt", model, opt, sched, scaler, epoch, globalStep, bestNll, valEpe, args)
+                print(f"  saved best.pt (valNLL={bestNll:.4f}, valEPE={valEpe:.4f})")
+            if valEpe > 1.10 * epeBase:
+                consecutiveBadEpochs += 1
+                print(f"  WARNING: valEPE {valEpe:.4f} > hard-stop threshold {1.10 * epeBase:.4f} "
+                      f"({consecutiveBadEpochs}/2 consecutive epochs)")
+                if consecutiveBadEpochs >= 2:
+                    print("  Hard stop: EPE degraded for 2 consecutive epochs. Aborting.")
+                    break
+            else:
+                consecutiveBadEpochs = 0
+        elif args.phase == 2:
             if valEpe < bestVal:
                 bestVal = valEpe
                 saveCheckpoint(args.outDir / "best_epe.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
@@ -298,7 +344,7 @@ def main():
                 model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args,
             )
 
-    if args.phase == 2:
+    if args.phase in (2, 3):
         print(f"best valEPE: {bestVal:.4f}  best valNLL: {bestNll:.4f}")
     else:
         print(f"best valEPE: {bestVal:.4f}")
