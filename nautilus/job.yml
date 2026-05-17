@@ -33,11 +33,17 @@ spec:
           git pull --rebase
 
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          conda run --no-capture-output -n lidarflow python codebase/submit.py \
-            --checkpoint ~/persistent/djrhee/Lidar-Flow/runs/run_20260508_153657/best.pt \
-            --split test \
+          conda run --no-capture-output -n lidarflow python codebase/train.py \
+            --phase 3 \
+            --phase1Ckpt ~/persistent/djrhee/Lidar-Flow/runs/run_20260508_153657/best.pt \
+            --lr 1e-3 \
+            --flowLr 5e-5 \
+            --epochs 5 \
+            --trainSamples 25000 \
             --voxelSize 0.1 \
-            --outDir ~/persistent/djrhee/Lidar-Flow/submissions/submission_${TIMESTAMP}
+            --checkpointEveryEpochs 1 \
+            --checkpointEverySteps 0 \
+            --outDir ~/persistent/djrhee/Lidar-Flow/runs/run_p3_${TIMESTAMP}
         resources:
           limits:
             memory: 12Gi
