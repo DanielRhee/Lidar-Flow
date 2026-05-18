@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: djrhee-lidarflow-train-v100
+  name: djrhee-lidarflow-eval-v100
   namespace: gilpin-lab
 spec:
   backoffLimit: 0
@@ -9,7 +9,7 @@ spec:
     spec:
       restartPolicy: Never
       containers:
-      - name: djrhee-lidarflow-train
+      - name: djrhee-lidarflow-eval
         image: ghcr.io/selkies-project/nvidia-glx-desktop:24.04-20240924062704
         env:
         - name: HOME
@@ -32,18 +32,34 @@ spec:
           git checkout -- .
           git pull --rebase
 
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          conda run --no-capture-output -n lidarflow python codebase/train.py \
-            --phase 3 \
-            --phase1Ckpt ~/persistent/djrhee/Lidar-Flow/runs/run_20260508_153657/best.pt \
-            --lr 1e-3 \
-            --flowLr 5e-5 \
-            --epochs 5 \
-            --trainSamples 25000 \
+          conda run --no-capture-output -n lidarflow python -m pip install -q scipy pandas pyarrow
+
+          CKPT_A=$(ls -t ~/persistent/djrhee/Lidar-Flow/runs/run_p2_*/best_nll.pt 2>/dev/null | head -1)
+          CKPT_B=$(ls -t ~/persistent/djrhee/Lidar-Flow/runs/run_p3_*/best.pt 2>/dev/null | head -1)
+          EVAL_DIR=~/persistent/djrhee/Lidar-Flow/runs/evaluation
+
+          echo "Checkpoint A: ${CKPT_A}"
+          echo "Checkpoint B: ${CKPT_B}"
+
+          [ -z "${CKPT_A}" ] && echo "ERROR: no run_p2_*/best_nll.pt found" && exit 1
+          [ -z "${CKPT_B}" ] && echo "ERROR: no run_p3_*/best.pt found" && exit 1
+
+          mkdir -p "${EVAL_DIR}"
+
+          conda run --no-capture-output -n lidarflow python codebase/evaluate.py \
+            --checkpoint "${CKPT_A}" \
             --voxelSize 0.1 \
-            --checkpointEveryEpochs 1 \
-            --checkpointEverySteps 0 \
-            --outDir ~/persistent/djrhee/Lidar-Flow/runs/run_p3_${TIMESTAMP}
+            --outFile "${EVAL_DIR}/dumpA.feather"
+
+          conda run --no-capture-output -n lidarflow python codebase/evaluate.py \
+            --checkpoint "${CKPT_B}" \
+            --voxelSize 0.1 \
+            --outFile "${EVAL_DIR}/dumpB.feather"
+
+          conda run --no-capture-output -n lidarflow python codebase/analysis.py \
+            --dumpA "${EVAL_DIR}/dumpA.feather" \
+            --dumpB "${EVAL_DIR}/dumpB.feather" \
+            --outDir "${EVAL_DIR}"
         resources:
           limits:
             memory: 12Gi
