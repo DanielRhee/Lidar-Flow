@@ -60,39 +60,27 @@ _COL_B = "#EF9A9A"
 
 def buildBucketMap():
     from av2.datasets.sensor.constants import AnnotationCategories
-    try:
-        from av2.evaluation.scene_flow.constants import BUCKETED_METACATAGORIES
-        firstVal = next(iter(BUCKETED_METACATAGORIES.values()))
-        if isinstance(firstVal, (list, tuple, set)):
-            nameToMeta = {}
-            for meta, names in BUCKETED_METACATAGORIES.items():
-                for n in names:
-                    nameToMeta[str(n)] = str(meta)
-        else:
-            nameToMeta = {str(k): str(v) for k, v in BUCKETED_METACATAGORIES.items()}
-    except (ImportError, AttributeError):
-        # known AV2 sceneflow challenge bucket groupings
-        nameToMeta = {
-            "PEDESTRIAN": "PEDESTRIAN",
-            "BICYCLIST": "WHEELED_VRU", "MOTORCYCLIST": "WHEELED_VRU",
-            "WHEELED_RIDER": "WHEELED_VRU",
-            "REGULAR_VEHICLE": "VEHICLE", "BOX_TRUCK": "VEHICLE",
-            "BUS": "VEHICLE", "LARGE_VEHICLE": "VEHICLE",
-            "SCHOOL_BUS": "VEHICLE", "ARTICULATED_BUS": "VEHICLE",
-            "TRUCK": "VEHICLE", "TRUCK_CAB": "VEHICLE",
-            "VEHICULAR_TRAILER": "VEHICLE",
-        }
+    # Explicit fine-grained map — VRU subtypes kept separate for per-bucket analysis.
+    nameToMeta = {
+        "PEDESTRIAN": "PEDESTRIAN",
+        "BICYCLIST": "BICYCLIST",
+        "MOTORCYCLIST": "MOTORCYCLIST",
+        "WHEELED_RIDER": "WHEELED_RIDER",
+        "REGULAR_VEHICLE": "VEHICLE", "BOX_TRUCK": "VEHICLE",
+        "BUS": "VEHICLE", "LARGE_VEHICLE": "VEHICLE",
+        "SCHOOL_BUS": "VEHICLE", "ARTICULATED_BUS": "VEHICLE",
+        "TRUCK": "VEHICLE", "TRUCK_CAB": "VEHICLE",
+        "VEHICULAR_TRAILER": "VEHICLE",
+    }
 
     idxToMeta = {}
     catList = list(AnnotationCategories)
     for i, cat in enumerate(catList):
         idxToMeta[i] = nameToMeta.get(cat.value, "OTHER_FOREGROUND")
 
-    # common background sentinels: index beyond enum length or uint8 wrap-around
     idxToMeta[len(catList)] = "BACKGROUND"
     idxToMeta[255] = "BACKGROUND"
 
-    # print so user can verify the background sentinel and bucket names used
     print("class index → bucket (verify background sentinel):")
     for idx in sorted(idxToMeta.keys()):
         name = catList[idx].value if idx < len(catList) else f"<sentinel {idx}>"
@@ -135,6 +123,38 @@ def sparsifyCurve(errMag, rankKey, nSteps=200):
     ns = np.maximum(1, np.round(fracs * N).astype(int))
     curve = cumErr[ns - 1] / ns
     return curve, fracs
+
+
+# ── σ Histogram + Quantiles ──────────────────────────────────────────────────
+
+def sigmaHistogram(dfA, dfB, outDir):
+    print("\n── σ Histogram + Quantiles ──")
+    fig, ax = plt.subplots(figsize=(9, 5))
+    fig.suptitle("Predicted σ distribution", color="#ddd", fontsize=13)
+
+    quantRows = []
+    pcts = [1, 5, 25, 50, 75, 95, 99]
+    for df, col, label in ((dfA, _COL_A, "A"), (dfB, _COL_B, "B")):
+        sigma = df["predSigma"].values
+        ax.hist(sigma, bins=300, color=col, alpha=0.55, density=True, label=f"Checkpoint {label}")
+        qs = np.percentile(sigma, pcts)
+        row = {"ckpt": label}
+        for p, q in zip(pcts, qs):
+            row[f"p{p}"] = float(q)
+        quantRows.append(row)
+        print(f"  ckpt {label}: " + "  ".join(f"p{p}={q:.4f}" for p, q in zip(pcts, qs)))
+
+    ax.set_xlabel("σ (m)", fontsize=10)
+    ax.set_ylabel("Density (log scale)", fontsize=10)
+    ax.set_yscale("log")
+    ax.legend(fontsize=9)
+    ax.grid(True)
+    plt.tight_layout()
+    fig.savefig(outDir / "sigma_histogram.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    pd.DataFrame(quantRows).to_csv(outDir / "sigma_quantiles.csv", index=False)
+    print("  → sigma_histogram.png, sigma_quantiles.csv")
 
 
 # ── Analysis 1: Sparsification + AUSE ────────────────────────────────────────
@@ -278,6 +298,160 @@ def coverageAtAlpha(dfA, dfB, outDir):
     print("  → coverage.png, coverage.csv")
 
 
+# ── Temperature scaling ───────────────────────────────────────────────────────
+
+def temperatureScaling(dfA, dfB, outDir):
+    print("\n── Temperature Scaling ──")
+    alphas = [0.50, 0.75, 0.90, 0.95]
+    thresholds = [float(spStats.chi2.ppf(a, df=3)) for a in alphas]
+    nBins = 15
+    rng = np.random.default_rng(42)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    fig.suptitle("Coverage before / after temperature scaling  (χ² df=3)", color="#ddd", fontsize=13)
+    tsRows = []
+
+    for ax, df, col, label in zip(axes, (dfA, dfB), (_COL_A, _COL_B), ("A", "B")):
+        sigma = df["predSigma"].values
+        sqErr = df["sqErr"].values
+        n = len(sigma)
+
+        # 20 % calibration / 80 % test
+        calIdx = rng.choice(n, int(0.2 * n), replace=False)
+        calMask = np.zeros(n, dtype=bool)
+        calMask[calIdx] = True
+        testMask = ~calMask
+
+        # Analytic optimum: minimises Gaussian NLL w.r.t. scalar T
+        T = float(np.sqrt(np.mean(sqErr[calMask] / (sigma[calMask] ** 2 + 1e-12))))
+        sigT = sigma[testMask] * T
+
+        # NLL before / after on test split
+        nllBefore = float(np.mean(0.5 * np.log(2 * np.pi * sigma[testMask] ** 2)
+                                  + sqErr[testMask] / (2 * sigma[testMask] ** 2 + 1e-12)))
+        nllAfter  = float(np.mean(0.5 * np.log(2 * np.pi * sigT ** 2)
+                                  + sqErr[testMask] / (2 * sigT ** 2 + 1e-12)))
+
+        # ENCE before / after
+        def _ence(sig, sq):
+            edges = np.quantile(sig, np.linspace(0, 1, nBins + 1))
+            binIds = np.digitize(sig, edges[1:-1])
+            ms, rs = [], []
+            for b in range(nBins):
+                m = binIds == b
+                if not m.any():
+                    continue
+                ms.append(sig[m].mean())
+                rs.append(np.sqrt(sq[m].mean()))
+            ms, rs = np.array(ms), np.array(rs)
+            return float(np.mean(np.abs(rs - ms) / (ms + 1e-8)))
+
+        enceBefore = _ence(sigma[testMask], sqErr[testMask])
+        enceAfter  = _ence(sigT, sqErr[testMask])
+
+        # Coverage before / after
+        varBefore = sigma[testMask] ** 2 + 1e-8
+        varAfter  = sigT ** 2 + 1e-8
+        row = {"ckpt": label, "T": T,
+               "nllBefore": nllBefore, "nllAfter": nllAfter,
+               "enceBefore": enceBefore, "enceAfter": enceAfter}
+        empBefore, empAfter = [], []
+        for a, thresh in zip(alphas, thresholds):
+            eb = float((sqErr[testMask] / varBefore <= thresh).mean())
+            ea = float((sqErr[testMask] / varAfter  <= thresh).mean())
+            row[f"coverBefore_{a:.2f}"] = eb
+            row[f"coverAfter_{a:.2f}"]  = ea
+            empBefore.append(eb)
+            empAfter.append(ea)
+        tsRows.append(row)
+        print(f"  ckpt {label}: T={T:.4f}  NLL {nllBefore:.4f}→{nllAfter:.4f}"
+              f"  ENCE {enceBefore:.4f}→{enceAfter:.4f}")
+
+        ax.plot([0, 1], [0, 1], color="#888", linewidth=1.2, linestyle="--", label="ideal")
+        ax.plot(alphas, empBefore, color=col, linewidth=1.8, linestyle="-",  label="before")
+        ax.plot(alphas, empAfter,  color=col, linewidth=1.8, linestyle=":",  label=f"after T={T:.2f}")
+        ax.scatter(alphas, empBefore, color=col, s=60, zorder=5)
+        ax.scatter(alphas, empAfter,  color=col, s=60, zorder=5, marker="^")
+        ax.set_xlabel("Target coverage α", fontsize=9)
+        ax.set_ylabel("Empirical coverage", fontsize=9)
+        ax.set_title(f"Checkpoint {label}", color="#ddd", fontsize=10)
+        ax.set_xlim(0.45, 1.0)
+        ax.set_ylim(0.45, 1.0)
+        ax.legend(fontsize=8)
+        ax.grid(True)
+
+    plt.tight_layout()
+    fig.savefig(outDir / "coverage_temp_scaled.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    pd.DataFrame(tsRows).to_csv(outDir / "temperature_scaling.csv", index=False)
+    print("  → coverage_temp_scaled.png, temperature_scaling.csv")
+
+
+# ── Per-bucket calibration ────────────────────────────────────────────────────
+
+def perBucketCalibration(dfA, dfB, outDir, bucketMap):
+    print("\n── Per-bucket calibration ──")
+
+    for dfX in (dfA, dfB):
+        if "bucket" not in dfX.columns:
+            dfX["bucket"] = dfX["classIdx"].map(lambda x: bucketMap.get(int(x), "OTHER_FOREGROUND"))
+
+    buckets = sorted(set(dfA["bucket"].unique()) | set(dfB["bucket"].unique()))
+    rows = []
+
+    for label, df in (("A", dfA), ("B", dfB)):
+        for bucket in buckets:
+            sub = df[df["bucket"] == bucket]
+            if len(sub) < 10:
+                continue
+            sigma  = sub["predSigma"].values
+            errMag = sub["errMag"].values
+            sqErr  = sub["sqErr"].values
+            rmse   = float(np.sqrt(sqErr.mean()))
+            meanSig = float(sigma.mean())
+            rho, _ = spStats.spearmanr(sigma, errMag)
+            rows.append({
+                "ckpt": label, "bucket": bucket, "n": len(sub),
+                "meanSigma": meanSig,
+                "meanErrMag": float(errMag.mean()),
+                "rmse": rmse,
+                "rmseOverSigma": rmse / (meanSig + 1e-9),
+                "sigmaP5":  float(np.percentile(sigma, 5)),
+                "sigmaP50": float(np.percentile(sigma, 50)),
+                "sigmaP95": float(np.percentile(sigma, 95)),
+                "spearmanRho": float(rho),
+            })
+
+    calDf = pd.DataFrame(rows)
+    calDf.to_csv(outDir / "per_bucket_calibration.csv", index=False)
+    print(calDf.to_string(float_format="{:.4f}".format))
+
+    # Bar chart: RMSE/σ per bucket
+    calA = calDf[calDf["ckpt"] == "A"].set_index("bucket")
+    calB = calDf[calDf["ckpt"] == "B"].set_index("bucket")
+    allBuckets = list(dict.fromkeys(r["bucket"] for r in rows))
+
+    fig, ax = plt.subplots(figsize=(max(8, len(allBuckets) * 1.3), 5))
+    x = np.arange(len(allBuckets))
+    w = 0.35
+    valsA = [calA.loc[b, "rmseOverSigma"] if b in calA.index else float("nan") for b in allBuckets]
+    valsB = [calB.loc[b, "rmseOverSigma"] if b in calB.index else float("nan") for b in allBuckets]
+    ax.bar(x - w / 2, valsA, w, color=_COL_A, alpha=0.8, label="A")
+    ax.bar(x + w / 2, valsB, w, color=_COL_B, alpha=0.8, label="B")
+    ax.axhline(float(np.nanmean(valsA)), color=_COL_A, linewidth=1.0, linestyle="--", alpha=0.7)
+    ax.axhline(float(np.nanmean(valsB)), color=_COL_B, linewidth=1.0, linestyle="--", alpha=0.7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(allBuckets, rotation=30, ha="right", fontsize=8)
+    ax.set_ylabel("RMSE / mean σ", fontsize=10)
+    ax.set_title("RMSE/σ per bucket  (flat → temperature scaling sufficient)", color="#ddd", fontsize=11)
+    ax.legend(fontsize=9)
+    ax.grid(True, axis="y")
+    plt.tight_layout()
+    fig.savefig(outDir / "rmse_over_sigma.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  → per_bucket_calibration.csv, rmse_over_sigma.png")
+
+
 # ── Analysis 4: Stratified table ─────────────────────────────────────────────
 
 def _buildStrataRows(df, groups, groupCol):
@@ -356,9 +530,12 @@ def main():
 
     bucketMap = buildBucketMap()
 
+    sigmaHistogram(dfA, dfB, args.outDir)
     sparsificationAndAuse(dfA, dfB, args.outDir)
     reliabilityAndEnce(dfA, dfB, args.outDir)
     coverageAtAlpha(dfA, dfB, args.outDir)
+    temperatureScaling(dfA, dfB, args.outDir)
+    perBucketCalibration(dfA, dfB, args.outDir, bucketMap)
     stratifiedTable(dfA, dfB, args.outDir, bucketMap)
 
     print(f"\ndone. outputs at {args.outDir}", flush=True)
