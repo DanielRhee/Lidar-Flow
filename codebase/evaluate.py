@@ -8,11 +8,22 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.ipc as ipc
 import torch
 from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset
 
 from model import SparseFlowNet, runForward
+
+_SCHEMA = pa.schema([
+    ("predFlowX", pa.float32()), ("predFlowY", pa.float32()), ("predFlowZ", pa.float32()),
+    ("predSigma", pa.float32()),
+    ("gtFlowX", pa.float32()), ("gtFlowY", pa.float32()), ("gtFlowZ", pa.float32()),
+    ("isDynamic", pa.bool_()), ("classIdx", pa.uint8()),
+    ("rangeMeters", pa.float32()), ("density", pa.uint16()),
+])
+_FLUSH_EVERY = 500
 
 
 def _identityCollate(batch):
@@ -65,7 +76,7 @@ def main():
 
     ds = ValCacheDataset(args.cacheDir, valIdx)
     dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=2,
-                    persistent_workers=True, pin_memory=True, prefetch_factor=4,
+                    persistent_workers=True, pin_memory=True, prefetch_factor=2,
                     collate_fn=_identityCollate)
     print(f"running on {len(valIdx)} val sweeps", flush=True)
 
@@ -74,6 +85,10 @@ def main():
         "gtFlowX", "gtFlowY", "gtFlowZ",
         "isDynamic", "classIdx", "rangeMeters", "density",
     )}
+
+    tmpPath = args.outFile.parent / (args.outFile.name + ".tmp")
+    totalPoints = 0
+    writer = ipc.new_file(str(tmpPath), _SCHEMA)
 
     t0 = time.time()
     for i, sample in enumerate(dl):
@@ -89,10 +104,10 @@ def main():
         mask0Np = mask0T.numpy()             # numpy version for scipy
 
         xyzAll = pc0[:, :3].numpy()
-        tree = cKDTree(xyzAll)
+        tree = cKDTree(xyzAll, balanced_tree=False, compact_nodes=False)
         xyzMasked = xyzAll[mask0Np]
         try:
-            density = tree.query_ball_point(xyzMasked, r=0.5, return_length=True)
+            density = tree.query_ball_point(xyzMasked, r=0.5, return_length=True, workers=-1)
         except TypeError:
             density = np.array([len(nb) for nb in tree.query_ball_point(xyzMasked, r=0.5)], dtype=np.intp)
 
@@ -119,25 +134,35 @@ def main():
         cols["rangeMeters"].append(rangeM[isValid])
         cols["density"].append(density.astype(np.uint16)[isValid])
 
+        if (i + 1) % _FLUSH_EVERY == 0 or i == len(dl) - 1:
+            if any(len(v) > 0 for v in cols.values()):
+                batch = pa.record_batch({
+                    "predFlowX": np.concatenate(cols["predFlowX"]).astype(np.float32),
+                    "predFlowY": np.concatenate(cols["predFlowY"]).astype(np.float32),
+                    "predFlowZ": np.concatenate(cols["predFlowZ"]).astype(np.float32),
+                    "predSigma": np.concatenate(cols["predSigma"]).astype(np.float32),
+                    "gtFlowX": np.concatenate(cols["gtFlowX"]).astype(np.float32),
+                    "gtFlowY": np.concatenate(cols["gtFlowY"]).astype(np.float32),
+                    "gtFlowZ": np.concatenate(cols["gtFlowZ"]).astype(np.float32),
+                    "isDynamic": np.concatenate(cols["isDynamic"]),
+                    "classIdx": np.concatenate(cols["classIdx"]).astype(np.uint8),
+                    "rangeMeters": np.concatenate(cols["rangeMeters"]).astype(np.float32),
+                    "density": np.concatenate(cols["density"]).astype(np.uint16),
+                }, schema=_SCHEMA)
+                totalPoints += batch.num_rows
+                writer.write_batch(batch)
+                for k in cols:
+                    cols[k] = []
+
         if (i + 1) % 50 == 0 or i == len(dl) - 1:
             elapsed = time.time() - t0
             rate = (i + 1) / elapsed
             eta = (len(dl) - i - 1) / rate / 60 if rate > 0 else 0
             print(f"  {i+1}/{len(dl)}  rate={rate:.2f} samp/s  eta={eta:.1f}min", flush=True)
 
-    df = pd.DataFrame({k: np.concatenate(v) for k, v in cols.items()})
-    df = df.astype({
-        "predFlowX": "float32", "predFlowY": "float32", "predFlowZ": "float32",
-        "predSigma": "float32",
-        "gtFlowX": "float32", "gtFlowY": "float32", "gtFlowZ": "float32",
-        "isDynamic": bool, "classIdx": "uint8",
-        "rangeMeters": "float32", "density": "uint16",
-    })
-
-    tmpPath = args.outFile.parent / (args.outFile.name + ".tmp")
-    df.reset_index(drop=True).to_feather(tmpPath)
+    writer.close()
     tmpPath.rename(args.outFile)
-    print(f"wrote {len(df):,} valid points → {args.outFile}", flush=True)
+    print(f"wrote {totalPoints:,} valid points → {args.outFile}", flush=True)
 
 
 if __name__ == "__main__":
