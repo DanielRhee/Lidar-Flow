@@ -6,7 +6,38 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pyarrow.ipc as ipc
 from scipy import stats as spStats
+
+_MAX_ROWS = 20_000_000
+
+
+def loadSampled(path, maxRows=_MAX_ROWS, seed=42):
+    # Read the IPC file one batch at a time, sampling proportionally to stay under maxRows.
+    # Peak memory = one decompressed batch (~1-2 GB) + sampled output (~800 MB).
+    with ipc.open_file(str(path)) as reader:
+        nBatches = reader.num_record_batches
+        firstBatch = reader.get_batch(0)
+        keepRate = min(1.0, maxRows / max(firstBatch.num_rows * nBatches, 1))
+        rng = np.random.default_rng(seed)
+
+        def sampleBatch(batch):
+            if keepRate >= 1.0:
+                return batch.to_pandas()
+            n = max(1, round(keepRate * batch.num_rows))
+            idx = np.sort(rng.choice(batch.num_rows, min(n, batch.num_rows), replace=False))
+            return batch.take(idx).to_pandas()
+
+        dfs = [sampleBatch(firstBatch)]
+        del firstBatch
+        for i in range(1, nBatches):
+            batch = reader.get_batch(i)
+            dfs.append(sampleBatch(batch))
+            del batch
+
+    df = pd.concat(dfs, ignore_index=True)
+    print(f"  sampled {len(df):,} / ~{round(maxRows / keepRate):,} points from {Path(path).name}")
+    return df
 
 
 plt.rcParams.update({
@@ -316,8 +347,8 @@ def main():
     args.outDir.mkdir(parents=True, exist_ok=True)
 
     print("loading dumps...", flush=True)
-    dfA = pd.read_feather(args.dumpA)
-    dfB = pd.read_feather(args.dumpB)
+    dfA = loadSampled(args.dumpA)
+    dfB = loadSampled(args.dumpB)
     print(f"  A: {len(dfA):,} points   B: {len(dfB):,} points")
 
     addDerivedCols(dfA)
