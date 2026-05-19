@@ -58,35 +58,32 @@ _COL_A = "#4FC3F7"
 _COL_B = "#EF9A9A"
 
 
+def rawClassDistribution(dfA, dfB, outDir):
+    print("\n── Raw classIdx distribution ──")
+    rows = []
+    for label, df in (("A", dfA), ("B", dfB)):
+        vc = df["classIdx"].value_counts(sort=False).sort_index()
+        total = len(df)
+        for idx, n in vc.items():
+            print(f"  [{label}] idx {int(idx):3d}: {n:>12,}  ({100*n/total:.3f}%)")
+            rows.append({"ckpt": label, "classIdx": int(idx), "n": int(n), "pct": round(100*n/total, 4)})
+    pd.DataFrame(rows).to_csv(outDir / "class_index_distribution.csv", index=False)
+    print("  → class_index_distribution.csv")
+
+
 def buildBucketMap():
-    from av2.datasets.sensor.constants import AnnotationCategories
-    # Explicit fine-grained map — VRU subtypes kept separate for per-bucket analysis.
-    nameToMeta = {
-        "PEDESTRIAN": "PEDESTRIAN",
-        "BICYCLIST": "BICYCLIST",
-        "MOTORCYCLIST": "MOTORCYCLIST",
-        "WHEELED_RIDER": "WHEELED_RIDER",
-        "REGULAR_VEHICLE": "VEHICLE", "BOX_TRUCK": "VEHICLE",
-        "BUS": "VEHICLE", "LARGE_VEHICLE": "VEHICLE",
-        "SCHOOL_BUS": "VEHICLE", "ARTICULATED_BUS": "VEHICLE",
-        "TRUCK": "VEHICLE", "TRUCK_CAB": "VEHICLE",
-        "VEHICULAR_TRAILER": "VEHICLE",
+    # Hand-coded from observed data — AV2 sceneflow uses a different integer encoding
+    # than the sensor AnnotationCategories enum. Index 0 = BACKGROUND in this encoding.
+    # Update after inspecting class_index_distribution.csv for the PEDESTRIAN index.
+    return {
+        0:   "BACKGROUND",    # unannotated background points (~89% of valid data)
+        3:   "BICYCLIST",     # confirmed 4,675 points
+        14:  "MOTORCYCLIST",  # confirmed 2,505 points
+        18:  "VEHICLE",       # confirmed 2.08M points (REGULAR_VEHICLE)
+        29:  "WHEELED_RIDER", # confirmed 4,864 points
+        30:  "BACKGROUND",    # sentinel (~1,468 points)
+        255: "BACKGROUND",    # uint8-wrap sentinel
     }
-
-    idxToMeta = {}
-    catList = list(AnnotationCategories)
-    for i, cat in enumerate(catList):
-        idxToMeta[i] = nameToMeta.get(cat.value, "OTHER_FOREGROUND")
-
-    idxToMeta[len(catList)] = "BACKGROUND"
-    idxToMeta[255] = "BACKGROUND"
-
-    print("class index → bucket (verify background sentinel):")
-    for idx in sorted(idxToMeta.keys()):
-        name = catList[idx].value if idx < len(catList) else f"<sentinel {idx}>"
-        print(f"  {idx:3d}: {name} → {idxToMeta[idx]}")
-
-    return idxToMeta
 
 
 def addDerivedCols(df):
@@ -528,6 +525,7 @@ def main():
     addDerivedCols(dfA)
     addDerivedCols(dfB)
 
+    rawClassDistribution(dfA, dfB, args.outDir)
     bucketMap = buildBucketMap()
 
     sigmaHistogram(dfA, dfB, args.outDir)
