@@ -72,16 +72,26 @@ def rawClassDistribution(dfA, dfB, outDir):
 
 
 def buildBucketMap():
-    # Hand-coded from observed data — AV2 sceneflow uses a different integer encoding
-    # than the sensor AnnotationCategories enum. Index 0 = BACKGROUND in this encoding.
-    # Update after inspecting class_index_distribution.csv for the PEDESTRIAN index.
+    # Indices verified from raw class_index_distribution.csv.
+    # AV2 sceneflow uses AnnotationCategories enum order but with 0 = BACKGROUND
+    # (not ANIMAL). PEDESTRIAN (idx 16) has 0 valid points in the val set — flow.is_valid
+    # is False for pedestrian annotations throughout, which is an AV2 dataset artifact.
     return {
-        0:   "BACKGROUND",    # unannotated background points (~89% of valid data)
-        3:   "BICYCLIST",     # confirmed 4,675 points
-        14:  "MOTORCYCLIST",  # confirmed 2,505 points
-        18:  "VEHICLE",       # confirmed 2.08M points (REGULAR_VEHICLE)
-        29:  "WHEELED_RIDER", # confirmed 4,864 points
-        30:  "BACKGROUND",    # sentinel (~1,468 points)
+        0:   "BACKGROUND",    # 17,025,679 — unannotated background
+        1:   "VEHICLE",       # ARTICULATED_BUS (0 in val set)
+        5:   "VEHICLE",       # BOX_TRUCK (8,469)
+        6:   "VEHICLE",       # BUS (218,387)
+        10:  "VEHICLE",       # LARGE_VEHICLE (251)
+        18:  "VEHICLE",       # REGULAR_VEHICLE (1)
+        19:  "VEHICLE",       # SCHOOL_BUS (1,667,169) — largest vehicle class
+        24:  "VEHICLE",       # TRUCK (12)
+        25:  "VEHICLE",       # TRUCK_CAB (107,307)
+        26:  "VEHICLE",       # VEHICULAR_TRAILER (78,415)
+        3:   "BICYCLIST",     # 4,675
+        14:  "MOTORCYCLIST",  # 2,505
+        16:  "PEDESTRIAN",    # 0 valid points in val set (flow.is_valid=False throughout)
+        29:  "WHEELED_RIDER", # 4,864
+        30:  "BACKGROUND",    # sentinel (1,468)
         255: "BACKGROUND",    # uint8-wrap sentinel
     }
 
