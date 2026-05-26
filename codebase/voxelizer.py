@@ -46,16 +46,17 @@ def voxelize(points, voxelSize, pointRange):
 def saveBevPng(coords, spatialShape, voxelSize, pointRange, outPath):
     bev = torch.zeros((spatialShape[0], spatialShape[1]), dtype=torch.float32)
     bev[coords[:, 0].long().cpu(), coords[:, 1].long().cpu()] = 1.0
- 
-    plt.figure(figsize=(8, 8))
-    plt.imshow(bev.T.numpy(), origin='lower', cmap='gray_r',
-               extent=[pointRange[0], pointRange[3], pointRange[1], pointRange[4]])
-    plt.xlabel('x (m)')
-    plt.ylabel('y (m)')
-    plt.title('Occupied voxels (BEV)')
-    plt.tight_layout()
-    plt.savefig(outPath, dpi=100)
-    plt.close()
+
+    fig, ax = plt.subplots(figsize=(8, 8), facecolor='white')
+    ax.set_facecolor('white')
+    ax.imshow(bev.T.numpy(), origin='lower', cmap='gray_r',
+              extent=[pointRange[0], pointRange[3], pointRange[1], pointRange[4]])
+    ax.set_xlabel('x (m)')
+    ax.set_ylabel('y (m)')
+    ax.set_title('Occupied Voxels (BEV)')
+    fig.tight_layout()
+    fig.savefig(outPath, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
  
  
 if __name__ == '__main__':
@@ -66,7 +67,7 @@ if __name__ == '__main__':
     from av2.torch.data_loaders.scene_flow import SceneFlowDataloader
     import pyarrow.feather as feather
  
-    datasetDir = Path.home() / 'persistent' / 'data' / 'lidar'
+    datasetDir = Path.home() / 'persistent' / 'dataset' / 'lidar'
     split = 'train'
     logIdx = 0
     sweepIdx = 0
