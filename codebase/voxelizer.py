@@ -45,12 +45,15 @@ def voxelize(points, voxelSize, pointRange):
 
 def saveBevWithFlowPng(coords, spatialShape, pc0, pc1, pointRange, outPath):
     import numpy as np
+    from scipy.spatial import KDTree
 
     bev = torch.zeros((spatialShape[0], spatialShape[1]), dtype=torch.float32)
     bev[coords[:, 0].long().cpu(), coords[:, 1].long().cpu()] = 1.0
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7), facecolor='white')
+    fig, axes = plt.subplots(1, 3, figsize=(24, 7), facecolor='white')
+    XY_RANGE = 50.0
 
+    # Panel 1: occupied voxels
     ax0 = axes[0]
     ax0.set_facecolor('white')
     ax0.imshow(bev.T.numpy(), origin='lower', cmap='gray_r',
@@ -60,26 +63,58 @@ def saveBevWithFlowPng(coords, spatialShape, pc0, pc1, pointRange, outPath):
     ax0.set_title('Occupied Voxels (BEV)')
     ax0.set_aspect('equal')
 
+    p0 = pc0[:, :3].cpu().numpy()
+    p1 = pc1[:, :3].cpu().numpy() if pc1 is not None else None
+
+    # Panel 2: sweep overlay
     ax1 = axes[1]
     ax1.set_facecolor('white')
-    XY_RANGE = 50.0
     ax1.set_xlim(-XY_RANGE, XY_RANGE)
     ax1.set_ylim(-XY_RANGE, XY_RANGE)
     ax1.set_aspect('equal')
-
-    p0 = pc0[:, :3].cpu().numpy()
     ax1.scatter(p0[:, 0], p0[:, 1], s=0.3, c='#333333', alpha=0.5, linewidths=0, label='sweep $t$')
-
-    if pc1 is not None:
-        p1 = pc1[:, :3].cpu().numpy()
-        ax1.scatter(p1[:, 0], p1[:, 1], s=0.3, c='#e63946', alpha=0.5, linewidths=0, label='sweep $t+1$')
+    if p1 is not None:
+        ax1.scatter(p1[:, 0], p1[:, 1], s=0.3, c='#4488ff', alpha=0.4, linewidths=0, label='sweep $t+1$')
         ax1.legend(loc='upper right', markerscale=8, framealpha=0.9)
         ax1.set_title('Consecutive Sweeps Overlay (BEV)')
     else:
         ax1.set_title('Point Cloud (BEV)')
-
     ax1.set_xlabel('x (m)')
     ax1.set_ylabel('y (m)')
+
+    # Panel 3: flow arrows
+    ax2 = axes[2]
+    ax2.set_facecolor('white')
+    ax2.set_xlim(-XY_RANGE, XY_RANGE)
+    ax2.set_ylim(-XY_RANGE, XY_RANGE)
+    ax2.set_aspect('equal')
+    ax2.scatter(p0[:, 0], p0[:, 1], s=0.3, c='#333333', alpha=0.4, linewidths=0)
+    if p1 is not None:
+        # Approximate flow: nearest-neighbor match, ego-motion removed via median subtraction
+        inRange = (np.abs(p0[:, 0]) < XY_RANGE) & (np.abs(p0[:, 1]) < XY_RANGE)
+        p0r = p0[inRange]
+        p0s = p0r[::max(1, len(p0r) // 3000)]
+
+        tree = KDTree(p1[:, :2])
+        _, nnIdx = tree.query(p0s[:, :2])
+        flowVec = p1[nnIdx, :2] - p0s[:, :2]
+
+        relFlow = flowVec - np.median(flowVec, axis=0)
+        mag = np.linalg.norm(relFlow, axis=1)
+        movingMask = (mag > 0.5) & (mag < 15.0)
+
+        if movingMask.any():
+            ax2.quiver(
+                p0s[movingMask, 0], p0s[movingMask, 1],
+                relFlow[movingMask, 0], relFlow[movingMask, 1],
+                color='#ffdd00', alpha=0.9, scale=1, scale_units='xy',
+                width=0.004, headwidth=4, zorder=5,
+            )
+        ax2.set_title('Approximate Scene Flow (BEV)')
+    else:
+        ax2.set_title('Scene Flow (BEV)')
+    ax2.set_xlabel('x (m)')
+    ax2.set_ylabel('y (m)')
 
     fig.tight_layout()
     fig.savefig(outPath, dpi=300, bbox_inches='tight', facecolor='white')
