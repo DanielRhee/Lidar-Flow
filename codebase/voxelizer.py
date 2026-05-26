@@ -43,7 +43,7 @@ def voxelize(points, voxelSize, pointRange):
     return features, coords, spatialShape, inverse, inRangeMask
 
 
-def saveBevWithFlowPng(coords, spatialShape, pc0, flow, pointRange, outPath):
+def saveBevWithFlowPng(coords, spatialShape, pc0, pc1, pointRange, outPath):
     import numpy as np
 
     bev = torch.zeros((spatialShape[0], spatialShape[1]), dtype=torch.float32)
@@ -68,23 +68,15 @@ def saveBevWithFlowPng(coords, spatialShape, pc0, flow, pointRange, outPath):
     ax1.set_aspect('equal')
 
     p0 = pc0[:, :3].cpu().numpy()
-    ax1.scatter(p0[:, 0], p0[:, 1], s=0.4, c='#888888', alpha=0.5, linewidths=0)
+    ax1.scatter(p0[:, 0], p0[:, 1], s=0.3, c='#333333', alpha=0.5, linewidths=0, label='sweep $t$')
 
-    if flow is not None:
-        fv = flow.flow.cpu().numpy()
-        dyn = flow.is_dynamic.cpu().numpy().astype(bool)
-        inRange = (np.abs(p0[:, 0]) < XY_RANGE) & (np.abs(p0[:, 1]) < XY_RANGE)
-        arrowIdx = np.where(dyn & inRange)[0][::5]
-        ax1.quiver(
-            p0[arrowIdx, 0], p0[arrowIdx, 1],
-            fv[arrowIdx, 0], fv[arrowIdx, 1],
-            color='#e63946', alpha=0.85,
-            scale=1, scale_units='xy',
-            width=0.003, headwidth=4, zorder=4,
-        )
-        ax1.set_title('Scene Flow — Dynamic Points (BEV)')
+    if pc1 is not None:
+        p1 = pc1[:, :3].cpu().numpy()
+        ax1.scatter(p1[:, 0], p1[:, 1], s=0.3, c='#e63946', alpha=0.5, linewidths=0, label='sweep $t+1$')
+        ax1.legend(loc='upper right', markerscale=8, framealpha=0.9)
+        ax1.set_title('Consecutive Sweeps Overlay (BEV)')
     else:
-        ax1.set_title('Scene Flow (no annotations — test split)')
+        ax1.set_title('Point Cloud (BEV)')
 
     ax1.set_xlabel('x (m)')
     ax1.set_ylabel('y (m)')
@@ -96,13 +88,14 @@ def saveBevWithFlowPng(coords, spatialShape, pc0, flow, pointRange, outPath):
  
 if __name__ == '__main__':
     from pathlib import Path
+    import numpy as np
     import matplotlib.pyplot as plt
-    from extractSceneflow import buildLoader, loadAnnotation
+    import pyarrow.feather as feather
 
-    datasetDir = Path.home() / 'persistent' / 'dataset'
-    dataset = 'sensor'
+    datasetDir = Path.home() / 'persistent' / 'dataset' / 'lidar'
     split = 'train'
-    idx = 0
+    logIdx = 0
+    sweepIdx = 0
 
     voxelSize = 0.1
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
@@ -110,14 +103,28 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device: {device}')
 
-    loader = buildLoader(datasetDir, dataset, split)
-    pc0, pc1, flow, sweepUuid = loadAnnotation(loader, idx)
-    pc0 = pc0.to(device)
+    splitDir = datasetDir / split
+    logDirs = sorted([d for d in splitDir.iterdir() if d.is_dir()])
+    logDir = logDirs[logIdx]
+    sweepFiles = sorted((logDir / 'sensors' / 'lidar').glob('*.feather'))
+    sweepPath = sweepFiles[sweepIdx]
+    print(f'log: {logDir.name}, sweep: {sweepPath.name}')
+
+    df = feather.read_feather(sweepPath)
+    xyz = torch.from_numpy(np.stack([df['x'].to_numpy(), df['y'].to_numpy(), df['z'].to_numpy()], axis=1)).to(torch.float32)
+    intensity = torch.from_numpy(df['intensity'].to_numpy()).to(torch.float32)
+    pc0 = torch.cat([xyz, intensity.unsqueeze(1)], dim=1).to(device)
     print(f'input points: {pc0.shape}')
 
     features, coords, spatialShape, _, _ = voxelize(pc0, voxelSize, pointRange)
     print(f'spatial shape: {list(spatialShape)}, occupied voxels: {features.shape[0]}')
 
+    sweepPath1 = sweepFiles[sweepIdx + 1]
+    df1 = feather.read_feather(sweepPath1)
+    xyz1 = torch.from_numpy(np.stack([df1['x'].to_numpy(), df1['y'].to_numpy(), df1['z'].to_numpy()], axis=1)).to(torch.float32)
+    intensity1 = torch.from_numpy(df1['intensity'].to_numpy()).to(torch.float32)
+    pc1 = torch.cat([xyz1, intensity1.unsqueeze(1)], dim=1)
+
     outPath = Path(__file__).parent / 'voxel_bev.png'
-    saveBevWithFlowPng(coords, spatialShape, pc0, flow, pointRange, outPath)
+    saveBevWithFlowPng(coords, spatialShape, pc0, pc1, pointRange, outPath)
     print(f'saved to {outPath}')
