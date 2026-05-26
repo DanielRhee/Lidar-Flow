@@ -100,7 +100,7 @@ if __name__ == '__main__':
     from extractSceneflow import buildLoader, loadAnnotation
 
     datasetDir = Path.home() / 'persistent' / 'dataset'
-    dataset = 'lidar'
+    dataset = 'sensor'
     split = 'train'
     idx = 0
 
