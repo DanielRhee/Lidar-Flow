@@ -1,6 +1,58 @@
+import numpy as np
+import pandas as pd
 import torch
 from av2.torch.data_loaders.scene_flow import SceneFlowDataloader
 from pathlib import Path
+
+
+def _quatToMat(qw, qx, qy, qz):
+    return np.array([
+        [1-2*(qy**2+qz**2), 2*(qx*qy-qz*qw), 2*(qx*qz+qy*qw)],
+        [2*(qx*qy+qz*qw), 1-2*(qx**2+qz**2), 2*(qy*qz-qx*qw)],
+        [2*(qx*qz-qy*qw), 2*(qy*qz+qx*qw), 1-2*(qx**2+qy**2)]
+    ], dtype=np.float64)
+
+
+class RawSweepLoader:
+    # Loads consecutive lidar sweep pairs directly from feather files;
+    # no scene flow annotation files required (works with test split).
+    def __init__(self, datasetDir, dataset, split):
+        splitDir = Path(datasetDir) / dataset / split
+        self._pairs = []   # (logDir, ts0, ts1)
+        self._egoCache = {}  # logName -> {timestamp_ns: (R, t)}
+        for logDir in sorted(d for d in splitDir.iterdir() if d.is_dir()):
+            lidarDir = logDir / 'sensors' / 'lidar'
+            timestamps = sorted(int(f.stem) for f in lidarDir.glob('*.feather'))
+            for ts0, ts1 in zip(timestamps[:-1], timestamps[1:]):
+                self._pairs.append((logDir, ts0, ts1))
+            egoDF = pd.read_feather(logDir / 'city_SE3_egovehicle.feather').set_index('timestamp_ns')
+            self._egoCache[logDir.name] = {
+                ts: (_quatToMat(row.qw, row.qx, row.qy, row.qz),
+                     np.array([row.tx_m, row.ty_m, row.tz_m]))
+                for ts, row in egoDF.iterrows()
+            }
+
+    def __len__(self):
+        return len(self._pairs)
+
+    def __getitem__(self, idx):
+        logDir, ts0, ts1 = self._pairs[idx]
+        pc0Raw = pd.read_feather(logDir / 'sensors/lidar' / f'{ts0}.feather').to_numpy(dtype=np.float32)
+        pc1Raw = pd.read_feather(logDir / 'sensors/lidar' / f'{ts1}.feather').to_numpy(dtype=np.float32)
+
+        egoByTs = self._egoCache[logDir.name]
+        R0, t0 = egoByTs[ts0]
+        R1, t1 = egoByTs[ts1]
+        # ego0_SE3_ego1: transforms points from ego1 frame into ego0 frame
+        R = (R0.T @ R1).astype(np.float32)
+        t = (R0.T @ (t1 - t0)).astype(np.float32)
+
+        pc0 = torch.from_numpy(pc0Raw)
+        pc1_t = torch.from_numpy(pc1Raw)
+        pc1XYZ = pc1_t[:, :3] @ torch.from_numpy(R).T + torch.from_numpy(t)
+        pc1 = torch.cat([pc1XYZ, pc1_t[:, 3:]], dim=1)
+
+        return pc0, pc1, None, (logDir.name, ts0)
 
 def buildLoader(datasetDir, dataset, split):
     return SceneFlowDataloader(
