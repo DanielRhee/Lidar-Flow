@@ -15,7 +15,7 @@ from model import SparseFlowNet, runForward
 def loadModel(checkpointPath, device):
     model = SparseFlowNet(inC=10).to(device)
     ckpt = torch.load(checkpointPath, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
     return model
 
