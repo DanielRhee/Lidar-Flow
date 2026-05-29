@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import torch
-from av2.evaluation.scene_flow.utils import write_output_file
+from av2.evaluation.scene_flow.utils import get_eval_subset, get_eval_point_mask, write_output_file
 
 from extractSceneflow import buildLoader, loadAnnotation
 from model import SparseFlowNet, runForward
@@ -48,6 +48,8 @@ def main():
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--limit", type=int, default=-1,
                         help="cap samples (debug); -1 runs the full split")
+    parser.add_argument("--maskFile", type=Path, required=True,
+                        help="official eval mask archive (from make_mask_files)")
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -66,30 +68,34 @@ def main():
     print(f"loaded checkpoint from {args.checkpoint}", flush=True)
 
     loader = buildLoader(args.datasetDir, args.dataset, args.split)
-    nSamples = len(loader) if args.limit < 0 else min(args.limit, len(loader))
+    evalInds = get_eval_subset(loader)
+    if args.limit >= 0:
+        evalInds = evalInds[:args.limit]
+    nSamples = len(evalInds)
     print(f"running inference on {nSamples} samples (split={args.split})", flush=True)
     print(f"writing outputs to {args.outDir}", flush=True)
 
     t0 = time.time()
-    for idx in range(nSamples):
+    for i, idx in enumerate(evalInds):
         pc0, pc1, _, sweepUuid = loadAnnotation(loader, idx)
 
         fullFlow = predictSample(model, pc0, pc1, args.voxelSize, pointRange, device, args.amp)
         mag = torch.linalg.vector_norm(fullFlow, dim=1)
         isDynamic = mag > args.dynamicThreshold
 
+        mask = get_eval_point_mask(sweepUuid, args.maskFile)
         write_output_file(
-            fullFlow.cpu().numpy(),
-            isDynamic.cpu().numpy(),
+            fullFlow[mask].cpu().numpy(),
+            isDynamic[mask].cpu().numpy(),
             sweepUuid,
             args.outDir,
         )
 
-        if (idx + 1) % 50 == 0 or idx == nSamples - 1:
+        if (i + 1) % 50 == 0 or i == nSamples - 1:
             elapsed = time.time() - t0
-            rate = (idx + 1) / elapsed
-            eta = (nSamples - idx - 1) / rate / 60 if rate > 0 else 0
-            print(f"  {idx + 1}/{nSamples}  rate={rate:.2f} samp/s  eta={eta:.1f}min", flush=True)
+            rate = (i + 1) / elapsed
+            eta = (nSamples - i - 1) / rate / 60 if rate > 0 else 0
+            print(f"  {i + 1}/{nSamples}  rate={rate:.2f} samp/s  eta={eta:.1f}min", flush=True)
 
     print(f"done in {time.time() - t0:.1f}s. outputs at {args.outDir}", flush=True)
     print("zip the output dir for leaderboard submission, e.g.:", flush=True)
