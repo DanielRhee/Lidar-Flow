@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import torch
-from av2.evaluation.scene_flow.utils import get_eval_subset, get_eval_point_mask, write_output_file
+from av2.evaluation.scene_flow.utils import get_eval_point_mask, write_output_file
 
 from extractSceneflow import buildLoader, loadAnnotation
 from model import SparseFlowNet, runForward
@@ -68,7 +68,7 @@ def main():
     print(f"loaded checkpoint from {args.checkpoint}", flush=True)
 
     loader = buildLoader(args.datasetDir, args.dataset, args.split)
-    evalInds = get_eval_subset(loader)
+    evalInds = list(range(len(loader)))
     if args.limit >= 0:
         evalInds = evalInds[:args.limit]
     nSamples = len(evalInds)
