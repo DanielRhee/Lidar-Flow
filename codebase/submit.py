@@ -69,13 +69,16 @@ def main():
 
     print(f"building loader for {args.split} split...", flush=True)
     loader = RawSweepLoader(args.datasetDir, args.dataset, args.split)
-    nSamples = len(loader) if args.limit < 0 else min(args.limit, len(loader))
+    evalInds = list(range(len(loader)))[::5]
+    if args.limit >= 0:
+        evalInds = evalInds[:args.limit]
+    nSamples = len(evalInds)
     print(f"running inference on {nSamples} samples (split={args.split})", flush=True)
     print(f"writing outputs to {args.outDir}", flush=True)
 
     t0 = time.time()
-    for i in range(nSamples):
-        pc0, pc1, _, sweepUuid = loader[i]
+    for i, idx in enumerate(evalInds):
+        pc0, pc1, _, sweepUuid = loader[idx]
 
         fullFlow = predictSample(model, pc0, pc1, args.voxelSize, pointRange, device, args.amp)
         mag = torch.linalg.vector_norm(fullFlow, dim=1)
