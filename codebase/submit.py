@@ -3,6 +3,7 @@ faulthandler.enable()
 
 import argparse
 import time
+import zipfile
 from pathlib import Path
 
 import torch
@@ -69,7 +70,11 @@ def main():
 
     print(f"building loader for {args.split} split...", flush=True)
     loader = RawSweepLoader(args.datasetDir, args.dataset, args.split)
-    evalInds = list(range(len(loader)))[::5]
+    with zipfile.ZipFile(args.maskFile) as zf:
+        maskUuids = {(n.split('/')[0], int(n.split('/')[1].replace('.feather', '')))
+                     for n in zf.namelist() if n.endswith('.feather')}
+    evalInds = [i for i, (logDir, ts0, ts1) in enumerate(loader._pairs)
+                if (logDir.name, ts0) in maskUuids]
     if args.limit >= 0:
         evalInds = evalInds[:args.limit]
     nSamples = len(evalInds)
