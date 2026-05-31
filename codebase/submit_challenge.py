@@ -102,6 +102,7 @@ def main():
 
     t0 = time.time()
     for i, (sceneId, timestamp) in enumerate(index):
+        timestamp = int(timestamp)
         h5Path = args.dataDir / f"{sceneId}.h5"
         if sceneId not in openFiles:
             openFiles[sceneId] = h5py.File(h5Path, "r")
