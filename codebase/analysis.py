@@ -41,21 +41,25 @@ def loadSampled(path, maxRows=_MAX_ROWS, seed=42):
 
 
 plt.rcParams.update({
-    "figure.facecolor": "#111",
-    "axes.facecolor": "#1a1a1a",
-    "axes.edgecolor": "#555",
-    "axes.labelcolor": "#ddd",
-    "xtick.color": "#aaa",
-    "ytick.color": "#aaa",
-    "text.color": "#ddd",
-    "grid.color": "#333",
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "axes.edgecolor": "#333",
+    "axes.labelcolor": "black",
+    "xtick.color": "#333",
+    "ytick.color": "#333",
+    "text.color": "black",
+    "grid.color": "#ccc",
     "grid.linestyle": "--",
-    "legend.facecolor": "#222",
-    "legend.edgecolor": "#444",
+    "legend.facecolor": "white",
+    "legend.edgecolor": "#888",
+    "font.size": 11,
+    "axes.titlesize": 12,
+    "axes.labelsize": 11,
+    "legend.fontsize": 10,
 })
 
-_COL_A = "#4FC3F7"
-_COL_B = "#EF9A9A"
+_COL_A = "#1f77b4"
+_COL_B = "#d62728"
 
 
 def rawClassDistribution(dfA, dfB, outDir):
@@ -137,7 +141,7 @@ def sparsifyCurve(errMag, rankKey, nSteps=200):
 def sigmaHistogram(dfA, dfB, outDir):
     print("\n── σ Histogram + Quantiles ──")
     fig, ax = plt.subplots(figsize=(9, 5))
-    fig.suptitle("Predicted σ distribution", color="#ddd", fontsize=13)
+    fig.suptitle("Predicted σ distribution", fontsize=13)
 
     quantRows = []
     pcts = [1, 5, 25, 50, 75, 95, 99]
@@ -157,7 +161,7 @@ def sigmaHistogram(dfA, dfB, outDir):
     ax.legend(fontsize=9)
     ax.grid(True)
     plt.tight_layout()
-    fig.savefig(outDir / "sigma_histogram.png", dpi=150, bbox_inches="tight")
+    fig.savefig(outDir / "sigma_histogram.png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
     pd.DataFrame(quantRows).to_csv(outDir / "sigma_quantiles.csv", index=False)
@@ -169,12 +173,12 @@ def sigmaHistogram(dfA, dfB, outDir):
 def sparsificationAndAuse(dfA, dfB, outDir):
     print("\n── Analysis 1: Sparsification + AUSE ──")
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    fig.suptitle("Sparsification Error Curves", color="#ddd", fontsize=13)
+    fig.suptitle("Sparsification Error Curves", fontsize=13)
     titles = ["All valid", "Dynamic", "Static"]
     auseRows = []
 
     for ax, title in zip(axes, titles):
-        ax.set_title(title, color="#ddd", fontsize=10)
+        ax.set_title(title, fontsize=10)
         ax.set_xlabel("Fraction retained", fontsize=9)
         ax.set_ylabel("Mean EPE (m)", fontsize=9)
         ax.grid(True)
@@ -206,7 +210,7 @@ def sparsificationAndAuse(dfA, dfB, outDir):
         ax.legend(fontsize=8)
 
     plt.tight_layout()
-    fig.savefig(outDir / "sparsification.png", dpi=150, bbox_inches="tight")
+    fig.savefig(outDir / "sparsification.png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
     auseDf = pd.DataFrame(auseRows)
@@ -220,7 +224,7 @@ def reliabilityAndEnce(dfA, dfB, outDir):
     print("\n── Analysis 2: Reliability + ENCE ──")
     nBins = 15
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-    fig.suptitle("Reliability Diagram  (σ vs RMSE per percentile bin)", color="#ddd", fontsize=13)
+    fig.suptitle("Reliability Diagram  (σ vs RMSE per percentile bin)", fontsize=13)
     enceRows = []
 
     for ax, df, col, label in zip(axes, (dfA, dfB), (_COL_A, _COL_B), ("A", "B")):
@@ -245,17 +249,17 @@ def reliabilityAndEnce(dfA, dfB, outDir):
         print(f"  ckpt {label}: ENCE={ence:.4f}")
 
         diag = np.array([meanSigmas.min(), meanSigmas.max()])
-        ax.plot(diag, diag, color="#888", linewidth=1.2, linestyle="--", label="ideal")
+        ax.plot(diag, diag, color="0.4", linewidth=1.2, linestyle="--", label="ideal")
         ax.scatter(meanSigmas, rmses, color=col, s=60, zorder=5, label=f"bins  ENCE={ence:.4f}")
         ax.plot(meanSigmas, rmses, color=col, linewidth=1.0, alpha=0.6)
         ax.set_xlabel("Mean predicted σ (m)", fontsize=9)
         ax.set_ylabel("RMSE (m)", fontsize=9)
-        ax.set_title(f"Checkpoint {label}", color="#ddd", fontsize=10)
+        ax.set_title(f"Checkpoint {label}", fontsize=10)
         ax.legend(fontsize=8)
         ax.grid(True)
 
     plt.tight_layout()
-    fig.savefig(outDir / "reliability.png", dpi=150, bbox_inches="tight")
+    fig.savefig(outDir / "reliability.png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
     pd.DataFrame(enceRows).to_csv(outDir / "ence.csv", index=False)
@@ -270,7 +274,7 @@ def coverageAtAlpha(dfA, dfB, outDir):
     thresholds = [float(spStats.chi2.ppf(a, df=3)) for a in alphas]
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-    fig.suptitle("Coverage at α-levels  (χ² df=3)", color="#ddd", fontsize=13)
+    fig.suptitle("Coverage at α-levels  (χ² df=3)", fontsize=13)
     covRows = []
 
     for ax, df, col, label in zip(axes, (dfA, dfB), (_COL_A, _COL_B), ("A", "B")):
@@ -286,19 +290,19 @@ def coverageAtAlpha(dfA, dfB, outDir):
             covRows.append({"ckpt": label, "target": a, "empirical": emp})
             print(f"  ckpt {label}: α={a:.2f}  empirical={emp:.4f}")
 
-        ax.plot([0, 1], [0, 1], color="#888", linewidth=1.2, linestyle="--", label="ideal")
+        ax.plot([0, 1], [0, 1], color="0.4", linewidth=1.2, linestyle="--", label="ideal")
         ax.scatter(alphas, empirical, color=col, s=80, zorder=5)
         ax.plot(alphas, empirical, color=col, linewidth=1.8, label=f"checkpoint {label}")
         ax.set_xlabel("Target coverage α", fontsize=9)
         ax.set_ylabel("Empirical coverage", fontsize=9)
-        ax.set_title(f"Checkpoint {label}", color="#ddd", fontsize=10)
+        ax.set_title(f"Checkpoint {label}", fontsize=10)
         ax.set_xlim(0.45, 1.0)
         ax.set_ylim(0.45, 1.0)
         ax.legend(fontsize=8)
         ax.grid(True)
 
     plt.tight_layout()
-    fig.savefig(outDir / "coverage.png", dpi=150, bbox_inches="tight")
+    fig.savefig(outDir / "coverage.png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
     pd.DataFrame(covRows).to_csv(outDir / "coverage.csv", index=False)
@@ -315,7 +319,7 @@ def temperatureScaling(dfA, dfB, outDir):
     rng = np.random.default_rng(42)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 5))
-    fig.suptitle("Coverage before / after temperature scaling  (χ² df=3)", color="#ddd", fontsize=13)
+    fig.suptitle("Coverage before / after temperature scaling  (χ² df=3)", fontsize=13)
     tsRows = []
 
     for ax, df, col, label in zip(axes, (dfA, dfB), (_COL_A, _COL_B), ("A", "B")):
@@ -374,21 +378,21 @@ def temperatureScaling(dfA, dfB, outDir):
         print(f"  ckpt {label}: T={T:.4f}  NLL {nllBefore:.4f}→{nllAfter:.4f}"
               f"  ENCE {enceBefore:.4f}→{enceAfter:.4f}")
 
-        ax.plot([0, 1], [0, 1], color="#888", linewidth=1.2, linestyle="--", label="ideal")
+        ax.plot([0, 1], [0, 1], color="0.4", linewidth=1.2, linestyle="--", label="ideal")
         ax.plot(alphas, empBefore, color=col, linewidth=1.8, linestyle="-",  label="before")
         ax.plot(alphas, empAfter,  color=col, linewidth=1.8, linestyle=":",  label=f"after T={T:.2f}")
         ax.scatter(alphas, empBefore, color=col, s=60, zorder=5)
         ax.scatter(alphas, empAfter,  color=col, s=60, zorder=5, marker="^")
         ax.set_xlabel("Target coverage α", fontsize=9)
         ax.set_ylabel("Empirical coverage", fontsize=9)
-        ax.set_title(f"Checkpoint {label}", color="#ddd", fontsize=10)
+        ax.set_title(f"Checkpoint {label}", fontsize=10)
         ax.set_xlim(0.45, 1.0)
         ax.set_ylim(0.45, 1.0)
         ax.legend(fontsize=8)
         ax.grid(True)
 
     plt.tight_layout()
-    fig.savefig(outDir / "coverage_temp_scaled.png", dpi=150, bbox_inches="tight")
+    fig.savefig(outDir / "coverage_temp_scaled.png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     pd.DataFrame(tsRows).to_csv(outDir / "temperature_scaling.csv", index=False)
     print("  → coverage_temp_scaled.png, temperature_scaling.csv")
@@ -450,11 +454,11 @@ def perBucketCalibration(dfA, dfB, outDir, bucketMap):
     ax.set_xticks(x)
     ax.set_xticklabels(allBuckets, rotation=30, ha="right", fontsize=8)
     ax.set_ylabel("RMSE / mean σ", fontsize=10)
-    ax.set_title("RMSE/σ per bucket  (flat → temperature scaling sufficient)", color="#ddd", fontsize=11)
+    ax.set_title("RMSE/σ per bucket  (flat → temperature scaling sufficient)", fontsize=11)
     ax.legend(fontsize=9)
     ax.grid(True, axis="y")
     plt.tight_layout()
-    fig.savefig(outDir / "rmse_over_sigma.png", dpi=150, bbox_inches="tight")
+    fig.savefig(outDir / "rmse_over_sigma.png", dpi=300, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print("  → per_bucket_calibration.csv, rmse_over_sigma.png")
 
