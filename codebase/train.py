@@ -143,6 +143,8 @@ def main():
                         help="cap number of training samples; -1 uses the full cached set")
     parser.add_argument("--valSamples", type=int, default=-1,
                         help="cap number of validation samples; -1 uses the full cached set")
+    parser.add_argument("--overfit", action="store_true",
+                        help="correctness probe: evaluate on the training subset itself")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weightDecay", type=float, default=1e-4)
@@ -189,7 +191,7 @@ def main():
         valIdx = valIdx[:args.valSamples]
     print(f"using {len(trainIdx)} train / {len(valIdx)} val samples from cache")
     trainDs = Subset(trainBase, trainIdx)
-    valDs = Subset(valBase, valIdx)
+    valDs = Subset(trainBase, trainIdx) if args.overfit else Subset(valBase, valIdx)
 
     trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=6,
                          persistent_workers=True, pin_memory=True, prefetch_factor=4,
