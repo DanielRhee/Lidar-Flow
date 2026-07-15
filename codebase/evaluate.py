@@ -15,6 +15,7 @@ from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset
 
 from model import SparseFlowNet, runForward
+from paths import DEFAULT_CACHE_DIR
 
 _SCHEMA = pa.schema([
     ("predFlowX", pa.float32()), ("predFlowY", pa.float32()), ("predFlowZ", pa.float32()),
@@ -54,8 +55,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--voxelSize", type=float, default=0.1)
-    parser.add_argument("--cacheDir", type=Path,
-                        default=Path.home() / "persistent" / "djrhee" / "lidarflow_cache")
+    parser.add_argument("--cacheDir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--outFile", type=Path, required=True)
     parser.add_argument("--valSamples", type=int, default=-1)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)

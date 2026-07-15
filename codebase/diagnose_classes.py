@@ -5,9 +5,10 @@ from pathlib import Path
 import torch
 from av2.datasets.sensor.constants import AnnotationCategories
 from extractSceneflow import buildLoader
+from paths import DEFAULT_CACHE_DIR
 
 def main():
-    cacheDir = Path.home() / "persistent" / "djrhee" / "lidarflow_cache"
+    cacheDir = DEFAULT_CACHE_DIR
 
     catList = list(AnnotationCategories)
     print("=== AnnotationCategories list-position → name ===")
