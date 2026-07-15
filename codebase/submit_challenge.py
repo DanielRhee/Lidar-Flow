@@ -15,16 +15,17 @@ from model import SparseFlowNet, runForward
 
 
 def loadModel(checkpointPath, device):
-    model = SparseFlowNet(inC=10).to(device)
+    model = SparseFlowNet(inC=8).to(device)
     ckpt = torch.load(checkpointPath, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
-    return model
+    return model, ckpt.get("voxelSize")
 
 
 @torch.no_grad()
-def predictSample(model, pc0, pc1, voxelSize, pointRange, device, amp):
-    with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+def predictSample(model, pc0, pc1, voxelSize, pointRange, device, ampDtype, amp):
+    """Per-point flow in the ego0 (ego-motion-compensated) frame the model trains in."""
+    with torch.autocast("cuda", dtype=ampDtype, enabled=amp):
         pred, _, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
     n = pc0.shape[0]
     fullFlow = torch.zeros((n, 3), dtype=torch.float32, device=device)
@@ -47,17 +48,14 @@ def loadFramePair(h5File, ts0, ts1):
     R_rel = (R0.T @ R1).astype(np.float32)
     t_rel = (R0.T @ (t1_vec - t0_vec)).astype(np.float32)
 
-    # Zero-pad to 10 features (model trained with inC=10)
-    def padTo10(pc):
-        padded = np.zeros((pc.shape[0], 10), dtype=np.float32)
-        padded[:, :pc.shape[1]] = pc
-        return torch.from_numpy(padded)
+    pc0 = torch.from_numpy(pc0Raw)[:, :3]
+    pc1 = torch.from_numpy(pc1Raw)[:, :3] @ torch.from_numpy(R_rel).T + torch.from_numpy(t_rel)
 
-    pc0 = padTo10(pc0Raw)
-    pc1_t = padTo10(pc1Raw)
-    pc1XYZ = pc1_t[:, :3] @ torch.from_numpy(R_rel).T + torch.from_numpy(t_rel)
-    pc1 = torch.cat([pc1XYZ, pc1_t[:, 3:]], dim=1)
-    return pc0, pc1
+    # ego1_SE3_ego0, to convert predictions back to the benchmark's frame.
+    ego1SE3ego0 = torch.eye(4, dtype=torch.float32)
+    ego1SE3ego0[:3, :3] = torch.from_numpy(R_rel.T)
+    ego1SE3ego0[:3, 3] = torch.from_numpy(-(R_rel.T @ t_rel))
+    return pc0, pc1, ego1SE3ego0
 
 
 def main():
@@ -68,6 +66,7 @@ def main():
     parser.add_argument("--outDir", type=Path, default=Path("submissions/challenge"))
     parser.add_argument("--voxelSize", type=float, default=0.2)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ampDtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--limit", type=int, default=-1,
                         help="cap samples for debugging; -1 runs all")
     args = parser.parse_args()
@@ -84,7 +83,11 @@ def main():
         flush=True,
     )
 
-    model = loadModel(args.checkpoint, device)
+    model, ckptVoxelSize = loadModel(args.checkpoint, device)
+    if ckptVoxelSize is not None and ckptVoxelSize != args.voxelSize:
+        raise SystemExit(
+            f"voxelSize mismatch: checkpoint {ckptVoxelSize} vs --voxelSize {args.voxelSize}")
+    ampDtype = torch.bfloat16 if args.ampDtype == "bf16" else torch.float16
     print(f"loaded checkpoint from {args.checkpoint}", flush=True)
 
     with open(args.dataDir / "index_eval.pkl", "rb") as f:
@@ -118,8 +121,14 @@ def main():
             fullFlow = np.zeros((n, 3), dtype=np.float32)
         else:
             ts1 = allTs[tsIdx + 1]
-            pc0, pc1 = loadFramePair(h5f, timestamp, ts1)
-            fullFlow = predictSample(model, pc0, pc1, args.voxelSize, pointRange, device, args.amp).cpu().numpy()
+            pc0, pc1, ego1SE3ego0 = loadFramePair(h5f, timestamp, ts1)
+            flowEgo0 = predictSample(model, pc0, pc1, args.voxelSize, pointRange,
+                                     device, ampDtype, args.amp)
+            # The model predicts in the ego0 frame; the benchmark scores flow that
+            # maps pc0 into the ego1 frame, so convert back.
+            M = ego1SE3ego0.to(device)
+            pc0Dev = pc0.to(device)
+            fullFlow = ((pc0Dev + flowEgo0) @ M[:3, :3].T + M[:3, 3] - pc0Dev).cpu().numpy()
 
         outPath = args.outDir / sceneId
         outPath.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,8 @@ _ALGO = ConvAlgo.Native if torch.cuda.is_available() and torch.cuda.get_device_c
 # Voxel combining/fusion stuff
 def buildUnion(f0, c0, f1, c1):
     device = f0.device
+    # Safe while the grid stays under 4096 per axis: 700x700x30 at voxelSize 0.2,
+    # 1400x1400x60 at 0.1. Collides silently below ~0.034 m.
     base = 4096
     h0 = (c0[:, 0].long() * base + c0[:, 1].long()) * base + c0[:, 2].long()
     h1 = (c1[:, 0].long() * base + c1[:, 1].long()) * base + c1[:, 2].long()
@@ -25,13 +27,14 @@ def buildUnion(f0, c0, f1, c1):
     cu = torch.zeros((Vu, 3), dtype=torch.int32, device=device)
     cu[invAll] = cAll
 
-    fu = torch.zeros((Vu, 10), dtype=torch.float32, device=device)
+    # Per sweep: 3 mean rel-xyz channels + 1 occupancy flag.
+    fu = torch.zeros((Vu, 8), dtype=torch.float32, device=device)
     inv0 = invAll[:V0]
     inv1 = invAll[V0:]
-    fu[inv0, 0:4] = f0
-    fu[inv0, 4] = 1.0
-    fu[inv1, 5:9] = f1
-    fu[inv1, 9] = 1.0
+    fu[inv0, 0:3] = f0
+    fu[inv0, 3] = 1.0
+    fu[inv1, 4:7] = f1
+    fu[inv1, 7] = 1.0
 
     return fu, cu, inv0
 
@@ -69,7 +72,7 @@ def catSparse(a, b):
 
 
 class SparseFlowNet(nn.Module):
-    def __init__(self, inC=10):
+    def __init__(self, inC=8):
         super().__init__()
         self.enc0 = subMBlock(inC, 32, "s0")
         self.down1 = downBlock(32, 64, "d1")
@@ -85,6 +88,17 @@ class SparseFlowNet(nn.Module):
         self.up1 = upBlock(64, 32, "d1")
         self.dec0 = subMBlock(64, 32, "s0")
         self.head = spconv.SubMConv3d(32, 3, 1, bias=True, indice_key="head", algo=_ALGO)
+        # Per-voxel flow is constant across every point in a voxel, which floors
+        # EPE at the voxel quantization scale. Refine it per point from the voxel
+        # feature plus the point's offset within its voxel. Zero-init the last
+        # layer so delta starts at exactly 0 and this is a true refinement.
+        self.refineHead = nn.Sequential(
+            nn.Linear(32 + 3, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 3),
+        )
+        nn.init.zeros_(self.refineHead[2].weight)
+        nn.init.zeros_(self.refineHead[2].bias)
         self.uncertaintyHead = nn.Sequential(
             nn.Linear(32, 32),
             nn.ReLU(True),
@@ -109,22 +123,13 @@ class SparseFlowNet(nn.Module):
         return flowOut, logVar
 
 
-# Normalize intensity of the data 
-def normalizeIntensity(col):
-    if col.numel() == 0:
-        return col
-    return col / torch.where(col.max() > 2.0, col.new_tensor(255.0), col.new_tensor(1.0))
-
-
 # end to end part that gets per point flow and runs everything above
 def runForwardFeatures(model, pc0, pc1, voxelSize, pointRange, device):
-    pc0 = pc0[:, :4].to(device=device, dtype=torch.float32, non_blocking=True)
-    pc1 = pc1[:, :4].to(device=device, dtype=torch.float32, non_blocking=True)
-    pc0[:, 3] = normalizeIntensity(pc0[:, 3])
-    pc1[:, 3] = normalizeIntensity(pc1[:, 3])
+    pc0 = pc0[:, :3].to(device=device, dtype=torch.float32, non_blocking=True)
+    pc1 = pc1[:, :3].to(device=device, dtype=torch.float32, non_blocking=True)
 
-    f0, c0, shape, inv0Point, mask0 = voxelize(pc0, voxelSize, pointRange)
-    f1, c1, _, _, _ = voxelize(pc1, voxelSize, pointRange)
+    f0, c0, shape, inv0Point, mask0, rel0Point = voxelize(pc0, voxelSize, pointRange)
+    f1, c1, _, _, _, _ = voxelize(pc1, voxelSize, pointRange)
 
     fu, cu, pc0ToUnion = buildUnion(f0, c0, f1, c1)
 
@@ -145,20 +150,24 @@ def runForwardFeatures(model, pc0, pc1, voxelSize, pointRange, device):
 
     d0 = model.forwardFeatures(x)
     assert d0.features.shape[0] == Vu, "spconv did not preserve union voxel ordering" # boooo
-    return d0, pc0ToUnion, inv0Point, mask0
+    return d0, pc0ToUnion, inv0Point, mask0, rel0Point
 
 
-def runForwardHeads(model, d0, pc0ToUnion, inv0Point):
+def runForwardHeads(model, d0, pc0ToUnion, inv0Point, rel0Point):
     flowOut = model.head(d0)
     logVar = torch.clamp(model.uncertaintyHead(d0.features), -10.0, 5.0)
 
     pointToUnion = pc0ToUnion[inv0Point]
-    predPerPoint = flowOut.features[pointToUnion]
+    voxelFlow = flowOut.features[pointToUnion]
+    # Break the per-voxel tie: every point in a voxel shares voxelFlow, so add a
+    # per-point delta conditioned on where the point sits inside its voxel.
+    delta = model.refineHead(torch.cat([d0.features[pointToUnion], rel0Point.to(d0.features.dtype)], dim=1))
+    predPerPoint = voxelFlow + delta
     predLogVarPerPoint = logVar[pointToUnion].squeeze(-1)
     return predPerPoint, predLogVarPerPoint
 
 
 def runForward(model, pc0, pc1, voxelSize, pointRange, device):
-    d0, pc0ToUnion, inv0Point, mask0 = runForwardFeatures(model, pc0, pc1, voxelSize, pointRange, device)
-    predPerPoint, predLogVarPerPoint = runForwardHeads(model, d0, pc0ToUnion, inv0Point)
+    d0, pc0ToUnion, inv0Point, mask0, rel0Point = runForwardFeatures(model, pc0, pc1, voxelSize, pointRange, device)
+    predPerPoint, predLogVarPerPoint = runForwardHeads(model, d0, pc0ToUnion, inv0Point, rel0Point)
     return predPerPoint, predLogVarPerPoint, mask0

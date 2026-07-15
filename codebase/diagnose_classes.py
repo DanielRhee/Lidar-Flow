@@ -1,10 +1,8 @@
-import json
 from collections import Counter
-from pathlib import Path
 
 import torch
 from av2.datasets.sensor.constants import AnnotationCategories
-from extractSceneflow import buildLoader
+from dataset import loadSplitIndices
 from paths import DEFAULT_CACHE_DIR
 
 def main():
@@ -16,14 +14,13 @@ def main():
         print(f"  {i:3d}: {cat.value}")
     print(f"  (total {len(catList)} categories; sentinel = {len(catList)})\n")
 
-    valIdx = json.loads((cacheDir / "val_indices.json").read_text())
+    valIdx = loadSplitIndices("val")
     sweepIdx = valIdx[0]
 
     sample = torch.load(cacheDir / "val" / f"{sweepIdx}.pt", weights_only=False)
-    _, _, flow, _ = sample
 
-    raw    = flow.category_indices.numpy()
-    valid  = flow.is_valid.numpy()
+    raw    = sample["categoryIndices"].numpy()
+    valid  = sample["isValid"].numpy()
 
     raw_counts = Counter(raw.tolist())
     print(f"=== Sweep {sweepIdx}: raw category_indices (before is_valid) ===")
