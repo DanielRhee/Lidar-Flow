@@ -10,37 +10,36 @@ def voxelize(points, voxelSize, pointRange):
     rangeMax = pointRange[3:]
  
     xyz = points[:, :3]
-    intensity = points[:, 3]
- 
+
     inRangeMask = ((xyz >= rangeMin) & (xyz < rangeMax)).all(dim=1)
     xyz = xyz[inRangeMask]
-    intensity = intensity[inRangeMask]
- 
+
     voxelIdx = torch.floor((xyz - rangeMin) / voxelSize).to(torch.long)
     xIdx, yIdx, zIdx = voxelIdx[:, 0], voxelIdx[:, 1], voxelIdx[:, 2]
- 
+
     # Flatten 3D voxel index to 1D for scatter-based aggregation
     flatIdx = xIdx * (Dy * Dz) + yIdx * Dz + zIdx
     uniqueFlat, inverse = torch.unique(flatIdx, return_inverse=True)
-    
-    numVoxels = uniqueFlat.shape[0] 
+
+    numVoxels = uniqueFlat.shape[0]
     voxelCenters = (voxelIdx.to(torch.float32) + 0.5) * voxelSize + rangeMin
     relXyz = xyz - voxelCenters
-    pointFeats = torch.cat([relXyz, intensity.unsqueeze(1)], dim=1)
-    featSum = torch.zeros((numVoxels, 4), dtype=torch.float32, device=device)
-    featSum.index_add_(0, inverse, pointFeats)
+    featSum = torch.zeros((numVoxels, 3), dtype=torch.float32, device=device)
+    featSum.index_add_(0, inverse, relXyz)
     counts = torch.zeros(numVoxels, dtype=torch.float32, device=device)
     counts.index_add_(0, inverse, torch.ones_like(inverse, dtype=torch.float32))
 
     features = featSum / counts.unsqueeze(1)
- 
+
     # Recover per-voxel 3D coords from unique flat indices
     zCoord = uniqueFlat % Dz
     yCoord = (uniqueFlat // Dz) % Dy
     xCoord = uniqueFlat // (Dy * Dz)
     coords = torch.stack([xCoord, yCoord, zCoord], dim=1).to(torch.int32)
- 
-    return features, coords, spatialShape, inverse, inRangeMask
+
+    # relXyz is per in-range point (not per voxel); the refinement head uses it to
+    # break the per-voxel flow tie between points sharing a voxel.
+    return features, coords, spatialShape, inverse, inRangeMask, relXyz
 
 
 def saveBevWithFlowPng(coords, spatialShape, pc0, pc1, pointRange, outPath):
@@ -127,7 +126,9 @@ if __name__ == '__main__':
     import matplotlib.pyplot as plt
     import pyarrow.feather as feather
 
-    datasetDir = Path.home() / 'persistent' / 'dataset' / 'lidar'
+    from paths import DEFAULT_SPLIT_ROOT
+
+    datasetDir = DEFAULT_SPLIT_ROOT
     split = 'train'
     logIdx = 0
     sweepIdx = 0
@@ -146,19 +147,15 @@ if __name__ == '__main__':
     print(f'log: {logDir.name}, sweep: {sweepPath.name}')
 
     df = feather.read_feather(sweepPath)
-    xyz = torch.from_numpy(np.stack([df['x'].to_numpy(), df['y'].to_numpy(), df['z'].to_numpy()], axis=1)).to(torch.float32)
-    intensity = torch.from_numpy(df['intensity'].to_numpy()).to(torch.float32)
-    pc0 = torch.cat([xyz, intensity.unsqueeze(1)], dim=1).to(device)
+    pc0 = torch.from_numpy(np.stack([df['x'].to_numpy(), df['y'].to_numpy(), df['z'].to_numpy()], axis=1)).to(torch.float32).to(device)
     print(f'input points: {pc0.shape}')
 
-    features, coords, spatialShape, _, _ = voxelize(pc0, voxelSize, pointRange)
+    features, coords, spatialShape, _, _, _ = voxelize(pc0, voxelSize, pointRange)
     print(f'spatial shape: {list(spatialShape)}, occupied voxels: {features.shape[0]}')
 
     sweepPath1 = sweepFiles[sweepIdx + 1]
     df1 = feather.read_feather(sweepPath1)
-    xyz1 = torch.from_numpy(np.stack([df1['x'].to_numpy(), df1['y'].to_numpy(), df1['z'].to_numpy()], axis=1)).to(torch.float32)
-    intensity1 = torch.from_numpy(df1['intensity'].to_numpy()).to(torch.float32)
-    pc1 = torch.cat([xyz1, intensity1.unsqueeze(1)], dim=1)
+    pc1 = torch.from_numpy(np.stack([df1['x'].to_numpy(), df1['y'].to_numpy(), df1['z'].to_numpy()], axis=1)).to(torch.float32)
 
     outPath = Path(__file__).parent / 'voxel_bev.png'
     saveBevWithFlowPng(coords, spatialShape, pc0, pc1, pointRange, outPath)

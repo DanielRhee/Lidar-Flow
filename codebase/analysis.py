@@ -9,6 +9,8 @@ import pandas as pd
 import pyarrow.ipc as ipc
 from scipy import stats as spStats
 
+from paths import DEFAULT_RUNS_DIR
+
 _MAX_ROWS = 20_000_000
 
 
@@ -525,8 +527,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dumpA", type=Path, required=True)
     parser.add_argument("--dumpB", type=Path, required=True)
-    parser.add_argument("--outDir", type=Path,
-                        default=Path.home() / "persistent" / "djrhee" / "Lidar-Flow" / "runs" / "evaluation")
+    parser.add_argument("--outDir", type=Path, default=DEFAULT_RUNS_DIR / "evaluation")
     args = parser.parse_args()
 
     args.outDir.mkdir(parents=True, exist_ok=True)

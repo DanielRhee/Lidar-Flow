@@ -4,6 +4,8 @@ import torch
 from av2.torch.data_loaders.scene_flow import SceneFlowDataloader
 from pathlib import Path
 
+from paths import DATASET_TYPE, DEFAULT_DATASET, DEFAULT_DATASET_DIR
+
 
 def _quatToMat(qw, qx, qy, qz):
     return np.array([
@@ -17,7 +19,8 @@ class RawSweepLoader:
     # Loads consecutive lidar sweep pairs directly from feather files;
     # no scene flow annotation files required (works with test split).
     def __init__(self, datasetDir, dataset, split):
-        splitDir = Path(datasetDir) / dataset / split
+        # Mirror av2's <root>/<dataset>/sensor/<split> convention.
+        splitDir = Path(datasetDir) / dataset / DATASET_TYPE / split
         self._pairs = []   # (logDir, ts0, ts1)
         self._egoCache = {}  # logName -> {timestamp_ns: (R, t)}
         for logDir in sorted(d for d in splitDir.iterdir() if d.is_dir()):
@@ -47,12 +50,21 @@ class RawSweepLoader:
         R = (R0.T @ R1).astype(np.float32)
         t = (R0.T @ (t1 - t0)).astype(np.float32)
 
-        pc0 = torch.from_numpy(pc0Raw)
-        pc1_t = torch.from_numpy(pc1Raw)
-        pc1XYZ = pc1_t[:, :3] @ torch.from_numpy(R).T + torch.from_numpy(t)
-        pc1 = torch.cat([pc1XYZ, pc1_t[:, 3:]], dim=1)
+        pc0 = torch.from_numpy(pc0Raw)[:, :3]
+        pc1 = torch.from_numpy(pc1Raw)[:, :3] @ torch.from_numpy(R).T + torch.from_numpy(t)
 
-        return pc0, pc1, None, (logDir.name, ts0)
+        # ego1_SE3_ego0, the inverse; submit.py needs it to convert predictions
+        # from the ego0 training frame back to the benchmark's convention.
+        ego1SE3ego0 = torch.eye(4, dtype=torch.float32)
+        ego1SE3ego0[:3, :3] = torch.from_numpy(R.T)
+        ego1SE3ego0[:3, 3] = torch.from_numpy(-(R.T @ t))
+
+        return {
+            "pc0": pc0,
+            "pc1": pc1,
+            "ego1SE3ego0": ego1SE3ego0,
+            "uuid": (logDir.name, ts0),
+        }
 
 def buildLoader(datasetDir, dataset, split):
     return SceneFlowDataloader(
@@ -63,23 +75,53 @@ def buildLoader(datasetDir, dataset, split):
         memory_mapped=False,
     )
 
-# Load a specific annotaiton in the dataset and correct the following sweep's ego motion. 2 modified point clouds as tensors and the flow 
+# Load a specific annotation in the dataset and correct the following sweep's ego motion.
 def loadAnnotation(loader, index):
+    """Return one cache sample: xyz-only fp16 sweeps, flow, and per-point masks.
+
+    Coordinates are stored fp16 because AV2 stores x/y/z as fp16 on disk, so for
+    pc0 this is lossless against the source. pc1's xyz is a genuine fp32 result of
+    the SE3 compensation; fp16 quantizes it to ~0.06 m at the 70 m range limit,
+    which is well under the 0.2 m voxel size.
+
+    is_ground comes from av2's map raster (SceneFlowDataloader builds an
+    ArgoverseStaticMap per item and passes it to Sweep.from_rust). It is kept as a
+    mask rather than applied here so ground removal stays ablatable.
+
+    Frame convention: av2's GT flow maps pc0 into the *ego1* frame, so a static
+    point's GT flow equals the ego motion. Since pc1 is compensated into the ego0
+    frame, the flow is brought back to ego0 as well:
+        flowEgo0 = ego0_SE3_ego1 . (pc0 + gtFlow) - pc0
+    which is 0 for a static point, leaving the network to model only real object
+    motion. submit.py inverts this back to the benchmark's convention.
+    """
     sweep0, sweep1, ego, flow = loader[index]
 
-    pc0 = sweep0.lidar.as_tensor()
+    pc0 = sweep0.lidar.as_tensor()[:, :3]
 
     pc1Raw = sweep1.lidar.as_tensor()
     ego_0_SE3_ego_1 = ego.inverse()
     R = ego_0_SE3_ego_1.rotation.matrix().squeeze(0)
     t = ego_0_SE3_ego_1.translation.squeeze(0)
-    pc1XYZ = (pc1Raw[:, :3] @ R.T) + t
-    pc1 = torch.cat([pc1XYZ, pc1Raw[:, 3:]], dim=1)
+    pc1 = (pc1Raw[:, :3] @ R.T) + t
+    flowEgo0 = ((pc0 + flow.flow) @ R.T + t) - pc0
 
-    return pc0, pc1, flow, sweep0.sweep_uuid
+    return {
+        "pc0": pc0.to(torch.float16),
+        "pc1": pc1.to(torch.float16),
+        "flow": flowEgo0.to(torch.float16),
+        # ego1_SE3_ego0 as [4,4]; inverts flowEgo0 back to the benchmark frame.
+        "ego1SE3ego0": ego.matrix().squeeze(0).to(torch.float32),
+        "isValid": flow.is_valid.to(torch.bool),
+        "isDynamic": flow.is_dynamic.to(torch.bool),
+        "categoryIndices": flow.category_indices.to(torch.uint8),
+        "isGround0": sweep0.is_ground.to(torch.bool),
+        "isGround1": sweep1.is_ground.to(torch.bool),
+        "uuid": sweep0.sweep_uuid,
+    }
 
 # Vibecoded visualization because it's not that important
-def visualize(pc0, pc1, flow):
+def visualize(sample):
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
@@ -87,8 +129,8 @@ def visualize(pc0, pc1, flow):
     def to_np(t):
         return t.detach().cpu().float().numpy()
 
-    p0 = to_np(pc0)   # [N, 7]
-    p1 = to_np(pc1)   # [M, 7]
+    p0 = to_np(sample["pc0"])   # [N, 3]
+    p1 = to_np(sample["pc1"])   # [M, 3]
 
     fig, axes = plt.subplots(1, 3, figsize=(21, 7))
     fig.patch.set_facecolor("#0d0d0d")
@@ -121,9 +163,9 @@ def visualize(pc0, pc1, flow):
     ax.scatter(p0[:, 1], p0[:, 0], s=0.4, c="#aaaaaa", alpha=0.4, linewidths=0, label="sweep0")
     ax.scatter(p1[:, 1], p1[:, 0], s=0.4, c="#4488ff", alpha=0.2, linewidths=0, label="sweep1")
 
-    if flow is not None:
-        fv  = to_np(flow.flow)                      # [N, 3]
-        dyn = to_np(flow.is_dynamic).astype(bool)  # [N]
+    if sample.get("flow") is not None:
+        fv  = to_np(sample["flow"])                      # [N, 3]
+        dyn = to_np(sample["isDynamic"]).astype(bool)   # [N]
 
         in_range   = (np.abs(p0[:, 0]) < XY_RANGE) & (np.abs(p0[:, 1]) < XY_RANGE)
         arrow_mask = dyn & in_range
@@ -152,11 +194,10 @@ def visualize(pc0, pc1, flow):
 
 
 if __name__ == "__main__":
-    datasetDir = Path.home() / "persistent"
-    dataset = "data"
+    datasetDir = DEFAULT_DATASET_DIR
+    dataset = DEFAULT_DATASET
     split = "train"
     index = 0
 
     loader = buildLoader(datasetDir, dataset, split)
-    pc0, pc1, flow, _ = loadAnnotation(loader, index)
-    visualize(pc0, pc1, flow)
+    visualize(loadAnnotation(loader, index))

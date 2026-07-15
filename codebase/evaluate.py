@@ -2,19 +2,19 @@ import faulthandler
 faulthandler.enable()
 
 import argparse
-import json
 import time
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import torch
 from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset
 
+from dataset import loadSplitIndices
 from model import SparseFlowNet, runForward
+from paths import DEFAULT_CACHE_DIR
 
 _SCHEMA = pa.schema([
     ("predFlowX", pa.float32()), ("predFlowY", pa.float32()), ("predFlowZ", pa.float32()),
@@ -31,8 +31,8 @@ def _identityCollate(batch):
 
 
 class ValCacheDataset(Dataset):
-    def __init__(self, cacheDir, indices):
-        self.dir = Path(cacheDir) / "val"
+    def __init__(self, cacheDir, indices, split="val"):
+        self.dir = Path(cacheDir) / split
         self.indices = indices
 
     def __len__(self):
@@ -43,22 +43,25 @@ class ValCacheDataset(Dataset):
 
 
 def loadModel(checkpointPath, device):
-    model = SparseFlowNet(inC=10).to(device)
+    model = SparseFlowNet(inC=8).to(device)
     ckpt = torch.load(checkpointPath, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    return model
+    return model, ckpt.get("voxelSize")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--voxelSize", type=float, default=0.1)
-    parser.add_argument("--cacheDir", type=Path,
-                        default=Path.home() / "persistent" / "djrhee" / "lidarflow_cache")
+    parser.add_argument("--voxelSize", type=float, default=None,
+                        help="defaults to the value stored in the checkpoint")
+    parser.add_argument("--cacheDir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--outFile", type=Path, required=True)
     parser.add_argument("--valSamples", type=int, default=-1)
+    parser.add_argument("--split", default="val", choices=["val", "pseudoTest"])
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ampDtype", choices=["bf16", "fp16"], default="bf16")
+    parser.add_argument("--removeGround", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     device = torch.device("cuda")
@@ -67,14 +70,22 @@ def main():
 
     args.outFile.parent.mkdir(parents=True, exist_ok=True)
 
-    model = loadModel(args.checkpoint, device)
-    print(f"loaded {args.checkpoint}", flush=True)
+    model, ckptVoxelSize = loadModel(args.checkpoint, device)
+    if args.voxelSize is None:
+        if ckptVoxelSize is None:
+            raise SystemExit("checkpoint has no voxelSize; pass --voxelSize explicitly")
+        args.voxelSize = ckptVoxelSize
+    elif ckptVoxelSize is not None and ckptVoxelSize != args.voxelSize:
+        raise SystemExit(
+            f"voxelSize mismatch: checkpoint {ckptVoxelSize} vs --voxelSize {args.voxelSize}")
+    ampDtype = torch.bfloat16 if args.ampDtype == "bf16" else torch.float16
+    print(f"loaded {args.checkpoint} (voxelSize={args.voxelSize})", flush=True)
 
-    valIdx = json.loads((args.cacheDir / "val_indices.json").read_text())
+    valIdx = loadSplitIndices(args.split)
     if args.valSamples > 0:
         valIdx = valIdx[:args.valSamples]
 
-    ds = ValCacheDataset(args.cacheDir, valIdx)
+    ds = ValCacheDataset(args.cacheDir, valIdx, args.split)
     dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=2,
                     persistent_workers=True, pin_memory=True, prefetch_factor=2,
                     collate_fn=_identityCollate)
@@ -92,10 +103,20 @@ def main():
 
     t0 = time.time()
     for i, sample in enumerate(dl):
-        pc0, pc1, flow, _ = sample
+        pc0, pc1 = sample["pc0"], sample["pc1"]
+        gtAll, validAll = sample["flow"], sample["isValid"]
+        dynAll, catAll = sample["isDynamic"], sample["categoryIndices"]
+
+        # Must mirror training: filter ground before voxelization, and subset the
+        # per-point GT identically so mask0 lines up.
+        if args.removeGround:
+            keep0 = ~sample["isGround0"]
+            pc0, pc1 = pc0[keep0], pc1[~sample["isGround1"]]
+            gtAll, validAll = gtAll[keep0], validAll[keep0]
+            dynAll, catAll = dynAll[keep0], catAll[keep0]
 
         with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+            with torch.autocast("cuda", dtype=ampDtype, enabled=args.amp):
                 pred, predLogVar, mask0 = runForward(model, pc0, pc1, args.voxelSize, pointRange, device)
 
         predSigma = torch.exp(0.5 * predLogVar.float()).cpu().numpy()
@@ -103,7 +124,7 @@ def main():
         mask0T = mask0.cpu()                 # bool tensor on CPU
         mask0Np = mask0T.numpy()             # numpy version for scipy
 
-        xyzAll = pc0[:, :3].numpy()
+        xyzAll = pc0.float().numpy()
         tree = cKDTree(xyzAll, balanced_tree=False, compact_nodes=False)
         xyzMasked = xyzAll[mask0Np]
         try:
@@ -114,10 +135,10 @@ def main():
         rangeM = np.linalg.norm(xyzMasked, axis=1).astype(np.float32)
 
         # index flow fields with CPU bool tensor (consistent with PyTorch)
-        gtFlow = flow.flow[mask0T]
-        isValid = flow.is_valid[mask0T].numpy().astype(bool)
-        isDynamic = flow.is_dynamic[mask0T].numpy().astype(bool)
-        catIdx = flow.category_indices[mask0T].numpy()
+        gtFlow = gtAll[mask0T].float()
+        isValid = validAll[mask0T].numpy().astype(bool)
+        isDynamic = dynAll[mask0T].numpy().astype(bool)
+        catIdx = catAll[mask0T].numpy()
 
         if not isValid.any():
             continue

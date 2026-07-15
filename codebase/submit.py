@@ -11,19 +11,21 @@ from av2.evaluation.scene_flow.utils import get_eval_point_mask, write_output_fi
 
 from extractSceneflow import RawSweepLoader
 from model import SparseFlowNet, runForward
+from paths import DEFAULT_DATASET, DEFAULT_DATASET_DIR
 
 
 def loadModel(checkpointPath, device):
-    model = SparseFlowNet(inC=10).to(device)
+    model = SparseFlowNet(inC=8).to(device)
     ckpt = torch.load(checkpointPath, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
-    return model
+    return model, ckpt.get("voxelSize")
 
 
 @torch.no_grad()
-def predictSample(model, pc0, pc1, voxelSize, pointRange, device, amp):
-    with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+def predictSample(model, pc0, pc1, voxelSize, pointRange, device, ampDtype, amp):
+    """Per-point flow in the ego0 (ego-motion-compensated) frame the model trains in."""
+    with torch.autocast("cuda", dtype=ampDtype, enabled=amp):
         pred, _, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
 
     n = pc0.shape[0]
@@ -32,10 +34,20 @@ def predictSample(model, pc0, pc1, voxelSize, pointRange, device, amp):
     return fullFlow
 
 
+def toBenchmarkFrame(pc0, flowEgo0, ego1SE3ego0):
+    """Invert the ego0 training convention back to the benchmark's.
+
+    The model predicts motion in the ego0 frame (static == 0); AV2 scores flow
+    that maps pc0 into the ego1 frame, so a static point's flow is the ego motion.
+    """
+    M = ego1SE3ego0.to(pc0.device)
+    return (pc0 + flowEgo0) @ M[:3, :3].T + M[:3, 3] - pc0
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--datasetDir", type=Path, default=Path.home() / "persistent")
-    parser.add_argument("--dataset", default="dataset")
+    parser.add_argument("--datasetDir", type=Path, default=DEFAULT_DATASET_DIR)
+    parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--split", default="test",
                         help="dataset split to run inference on; 'test' for leaderboard submission")
     parser.add_argument("--checkpoint", type=Path, required=True,
@@ -47,6 +59,7 @@ def main():
                         help="flow magnitude (m) above which a point is marked is_dynamic; "
                              "0.05m/sweep == 0.5m/s at 10Hz")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ampDtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--limit", type=int, default=-1,
                         help="cap samples (debug); -1 runs the full split")
     parser.add_argument("--maskFile", type=Path, required=True,
@@ -65,7 +78,13 @@ def main():
         flush=True,
     )
 
-    model = loadModel(args.checkpoint, device)
+    model, ckptVoxelSize = loadModel(args.checkpoint, device)
+    if ckptVoxelSize is not None and ckptVoxelSize != args.voxelSize:
+        raise SystemExit(
+            f"voxelSize mismatch: checkpoint was trained at {ckptVoxelSize} but "
+            f"--voxelSize is {args.voxelSize}. Re-run with --voxelSize {ckptVoxelSize}."
+        )
+    ampDtype = torch.bfloat16 if args.ampDtype == "bf16" else torch.float16
     print(f"loaded checkpoint from {args.checkpoint}", flush=True)
 
     print(f"building loader for {args.split} split...", flush=True)
@@ -83,15 +102,20 @@ def main():
 
     t0 = time.time()
     for i, idx in enumerate(evalInds):
-        pc0, pc1, _, sweepUuid = loader[idx]
+        sample = loader[idx]
+        pc0, sweepUuid = sample["pc0"], sample["uuid"]
 
-        fullFlow = predictSample(model, pc0, pc1, args.voxelSize, pointRange, device, args.amp)
-        mag = torch.linalg.vector_norm(fullFlow, dim=1)
-        isDynamic = mag > args.dynamicThreshold
+        flowEgo0 = predictSample(model, pc0, sample["pc1"], args.voxelSize,
+                                 pointRange, device, ampDtype, args.amp)
+        # is_dynamic means actually moving, so it is measured on the compensated
+        # flow. Measuring it on the benchmark-frame flow would mark every point
+        # dynamic whenever the ego is moving.
+        isDynamic = torch.linalg.vector_norm(flowEgo0, dim=1) > args.dynamicThreshold
+        submitFlow = toBenchmarkFrame(pc0.to(device), flowEgo0, sample["ego1SE3ego0"])
 
         mask = get_eval_point_mask(sweepUuid, args.maskFile)
         write_output_file(
-            fullFlow[mask].cpu().numpy(),
+            submitFlow[mask].cpu().numpy(),
             isDynamic[mask].cpu().numpy(),
             sweepUuid,
             args.outDir,

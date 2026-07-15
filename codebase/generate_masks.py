@@ -1,19 +1,20 @@
 """Generate test mask zip using a Z-threshold for ground (raster files unavailable)."""
 import zipfile
-from pathlib import Path
 
 import pandas as pd
 
 from extractSceneflow import RawSweepLoader
+from paths import DEFAULT_DATASET, DEFAULT_DATASET_DIR, DEFAULT_RUNS_DIR
 
 # Points with sensor-frame z below this are considered ground (~1.5m below sensor)
 GROUND_Z = -1.5
 
 
 def main():
-    loader = RawSweepLoader(Path.home() / 'persistent/dataset', 'lidar', 'test')
+    loader = RawSweepLoader(DEFAULT_DATASET_DIR, DEFAULT_DATASET, 'test')
     evalInds = list(range(len(loader)))[::5]
-    maskFile = Path.home() / 'persistent/djrhee/test_masks.zip'
+    maskFile = DEFAULT_RUNS_DIR / 'test_masks.zip'
+    maskFile.parent.mkdir(parents=True, exist_ok=True)
     print(f'building {len(evalInds)} masks → {maskFile}', flush=True)
 
     with zipfile.ZipFile(maskFile, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
