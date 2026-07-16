@@ -39,13 +39,25 @@ def buildUnion(f0, c0, f1, c1):
     return fu, cu, inv0
 
 
+_NORM_GROUPS = 8  # divides every block width here (32, 64, 128, 256)
+
+
+def norm(c):
+    # GroupNorm, not BatchNorm: it has no running-stat buffers, so train and eval
+    # normalize identically. BatchNorm's running stats were being poisoned by rare
+    # pathological batches (running_var -> NaN in deep layers), which broke eval /
+    # inference while train-mode limped on. GroupNorm removes that failure mode
+    # entirely. spconv routes it onto the [numVoxels, C] feature tensor.
+    return nn.GroupNorm(_NORM_GROUPS, c)
+
+
 def subMBlock(inC, outC, key):
     return spconv.SparseSequential(
         spconv.SubMConv3d(inC, outC, 3, padding=1, bias=False, indice_key=key, algo=_ALGO),
-        nn.BatchNorm1d(outC),
+        norm(outC),
         nn.ReLU(True),
         spconv.SubMConv3d(outC, outC, 3, padding=1, bias=False, indice_key=key, algo=_ALGO),
-        nn.BatchNorm1d(outC),
+        norm(outC),
         nn.ReLU(True),
     )
 
@@ -53,7 +65,7 @@ def subMBlock(inC, outC, key):
 def downBlock(inC, outC, key):
     return spconv.SparseSequential(
         spconv.SparseConv3d(inC, outC, 3, stride=2, padding=1, bias=False, indice_key=key, algo=_ALGO),
-        nn.BatchNorm1d(outC),
+        norm(outC),
         nn.ReLU(True),
     )
 
@@ -61,7 +73,7 @@ def downBlock(inC, outC, key):
 def upBlock(inC, outC, key):
     return spconv.SparseSequential(
         spconv.SparseInverseConv3d(inC, outC, 3, bias=False, indice_key=key, algo=_ALGO),
-        nn.BatchNorm1d(outC),
+        norm(outC),
         nn.ReLU(True),
     )
 
@@ -92,13 +104,20 @@ class SparseFlowNet(nn.Module):
         # EPE at the voxel quantization scale. Refine it per point from the voxel
         # feature plus the point's offset within its voxel. Zero-init the last
         # layer so delta starts at exactly 0 and this is a true refinement.
+        #
+        # Sized generously on purpose: training is kernel-launch-bound at
+        # batch_size=1 (~33% GPU, 0.39 GB of 16 GB), so extra width here costs
+        # almost no wall-clock, and per-point refinement is where the accuracy
+        # the voxel grid throws away has to come back.
         self.refineHead = nn.Sequential(
-            nn.Linear(32 + 3, 32),
+            nn.Linear(32 + 3, 128),
             nn.ReLU(True),
-            nn.Linear(32, 3),
+            nn.Linear(128, 128),
+            nn.ReLU(True),
+            nn.Linear(128, 3),
         )
-        nn.init.zeros_(self.refineHead[2].weight)
-        nn.init.zeros_(self.refineHead[2].bias)
+        nn.init.zeros_(self.refineHead[4].weight)
+        nn.init.zeros_(self.refineHead[4].bias)
         self.uncertaintyHead = nn.Sequential(
             nn.Linear(32, 32),
             nn.ReLU(True),

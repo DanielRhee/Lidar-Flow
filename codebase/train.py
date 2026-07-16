@@ -195,7 +195,11 @@ def main():
     parser.add_argument("--overfit", action="store_true",
                         help="correctness probe: evaluate on the training subset itself")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4,
+                        help="peak LR; 1e-3 was empirically too hot at effective batch 8 "
+                             "(recurrent non-finite losses)")
+    parser.add_argument("--warmupEpochs", type=float, default=1.0,
+                        help="linear LR warmup length in epochs before cosine decay")
     parser.add_argument("--weightDecay", type=float, default=1e-4)
     parser.add_argument("--voxelSize", type=float, default=0.2)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
@@ -207,6 +211,9 @@ def main():
                              "batch_size is fixed at 1 so this sets the effective batch")
     parser.add_argument("--loss", choices=["deflow", "epe"], default="deflow",
                         help="phase-1 loss; deflow is the speed-binned DeFlow loss")
+    parser.add_argument("--numWorkers", type=int, default=12,
+                        help="dataloader workers; training is dataloader-bound, so this "
+                             "is the main throughput knob on this box (18 cores)")
     parser.add_argument("--removeGround", action=argparse.BooleanOptionalAction, default=True,
                         help="drop map-derived ground points before voxelization")
     parser.add_argument("--outDir", type=Path, default=Path("runs/mvp"))
@@ -253,10 +260,12 @@ def main():
     valSource = "train (overfit probe)" if args.overfit else "val"
     print(f"using {len(trainDs)} train / {len(valDs)} {valSource} samples from cache")
 
-    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=6,
+    # Training is dataloader-bound, not GPU-bound: each sample is a ~2.2 MB
+    # torch.load + unpickle, and the GPU idles without enough workers feeding it.
+    trainDl = DataLoader(trainDs, batch_size=1, shuffle=True, num_workers=args.numWorkers,
                          persistent_workers=True, pin_memory=True, prefetch_factor=4,
                          collate_fn=identityCollate)
-    valDl = DataLoader(valDs, batch_size=1, shuffle=False, num_workers=2,
+    valDl = DataLoader(valDs, batch_size=1, shuffle=False, num_workers=max(2, args.numWorkers // 3),
                        persistent_workers=True, pin_memory=True, prefetch_factor=4,
                        collate_fn=identityCollate)
 
@@ -301,7 +310,20 @@ def main():
 
     # The scheduler steps once per optimizer step, not per sample.
     stepsPerEpoch = math.ceil(len(trainDl) / args.accumSteps)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(args.epochs * stepsPerEpoch, 1))
+    totalSteps = max(args.epochs * stepsPerEpoch, 1)
+    warmupSteps = min(int(args.warmupEpochs * stepsPerEpoch), totalSteps - 1)
+    if warmupSteps > 0:
+        # Linear warmup then cosine decay over the remaining steps. Warmup gives
+        # AdamW's second-moment estimate time to settle before the LR is at peak,
+        # which is what tamed the early-training divergence.
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            opt, start_factor=0.01, end_factor=1.0, total_iters=warmupSteps)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=max(totalSteps - warmupSteps, 1))
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt, [warmup, cosine], milestones=[warmupSteps])
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=totalSteps)
     # GradScaler only matters for fp16; under bf16 it is a no-op passthrough.
     ampDtype = torch.bfloat16 if args.ampDtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and ampDtype is torch.float16)
@@ -324,17 +346,19 @@ def main():
         # globalStep counts optimizer steps, not micro-batches.
         opt.zero_grad(set_to_none=True)
         pendingMicro = 0
+        skipped = 0
         for microIdx, sample in enumerate(trainDl):
             with torch.autocast("cuda", dtype=ampDtype, enabled=args.amp):
                 loss = runStep(model, sample, device, args.voxelSize, pointRange,
                                phase=args.phase, beta=args.beta,
                                removeGround=args.removeGround, loss=args.loss)
             if not torch.isfinite(loss):
-                if args.phase == 1:
-                    for m in model.modules():
-                        if isinstance(m, torch.nn.BatchNorm1d):
-                            m.reset_running_stats()
-                continue  # skip before backward so accumulated grads stay clean
+                # Skip the bad micro-batch before backward so accumulated grads
+                # stay clean. Do NOT reset BatchNorm running stats here: validation
+                # runs in eval() mode and depends on those stats, and wiping them on
+                # every NaN was silently corrupting val (running_var pinned at init).
+                skipped += 1
+                continue
             scaler.scale(loss / args.accumSteps).backward()
             trainSumDev += loss.detach()
             trainN += 1
@@ -381,19 +405,41 @@ def main():
                     valNllSum += nll.item(); valNllN += 1
 
         trainLoss = trainSumDev.item() / max(trainN, 1)
-        valEpe = valEpeSum / max(valEpeN, 1)
-        valDynEpe = valDynSum / max(valDynN, 1)
-        valStaticEpe = valStaticSum / max(valStaticN, 1)
-        valNll = valNllSum / max(valNllN, 1) if valNllN > 0 else float("nan")
+        # nan (not 0) when every val sample was non-finite, so divergence is loud
+        # rather than masked as a perfect score.
+        valEpe = valEpeSum / valEpeN if valEpeN > 0 else float("nan")
+        valDynEpe = valDynSum / valDynN if valDynN > 0 else float("nan")
+        valStaticEpe = valStaticSum / valStaticN if valStaticN > 0 else float("nan")
+        valNll = valNllSum / valNllN if valNllN > 0 else float("nan")
+        valFinite = valEpeN
         dt = time.time() - t0
 
+        peakGb = torch.cuda.max_memory_allocated() / 1e9
+        torch.cuda.reset_peak_memory_stats()
+        skipMsg = f"  SKIPPED={skipped}" if skipped else ""
+        finMsg = f"  valFinite={valFinite}/{len(valDl)}" if valFinite < len(valDl) else ""
         if args.phase in (2, 3):
             print(f"epoch {epoch}: trainNLL={trainLoss:.4f}  valEPE={valEpe:.4f}  "
                   f"valDynEPE={valDynEpe:.4f}  valStaticEPE={valStaticEpe:.4f}  "
-                  f"valNLL={valNll:.4f}  dt={dt:.1f}s")
+                  f"valNLL={valNll:.4f}  dt={dt:.1f}s  peakVram={peakGb:.2f}GB{skipMsg}{finMsg}")
         else:
             print(f"epoch {epoch}: trainLoss={trainLoss:.4f}  valEPE={valEpe:.4f}  "
-                  f"valDynEPE={valDynEpe:.4f}  valStaticEPE={valStaticEpe:.4f}  dt={dt:.1f}s")
+                  f"valDynEPE={valDynEpe:.4f}  valStaticEPE={valStaticEpe:.4f}  "
+                  f"dt={dt:.1f}s  peakVram={peakGb:.2f}GB{skipMsg}{finMsg}")
+
+        # Divergence guard: a non-finite val EPE means the model blew up. Abort
+        # after two in a row rather than burning the rest of the run.
+        if not math.isfinite(valEpe):
+            consecutiveBadEpochs += 1
+            print(f"  WARNING: valEPE is non-finite ({valFinite}/{len(valDl)} val samples finite) "
+                  f"({consecutiveBadEpochs}/2)", flush=True)
+            if consecutiveBadEpochs >= 2:
+                print("  Hard stop: validation diverged (non-finite) for 2 consecutive epochs.", flush=True)
+                saveCheckpoint(args.outDir / "last.pt", model, opt, sched, scaler,
+                               epoch, globalStep, bestVal, valEpe, args)
+                break
+        elif args.phase != 3:
+            consecutiveBadEpochs = 0
 
         saveCheckpoint(args.outDir / "last.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
 
@@ -414,14 +460,15 @@ def main():
             else:
                 consecutiveBadEpochs = 0
         elif args.phase == 2:
-            if valEpe < bestVal:
+            if math.isfinite(valEpe) and valEpe < bestVal:
                 bestVal = valEpe
                 saveCheckpoint(args.outDir / "best_epe.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
-            if not math.isnan(valNll) and valNll < bestNll:
+            if math.isfinite(valNll) and valNll < bestNll:
                 bestNll = valNll
                 saveCheckpoint(args.outDir / "best_nll.pt", model, opt, sched, scaler, epoch, globalStep, bestNll, valEpe, args)
         else:
-            if valEpe < bestVal:
+            # isfinite guard so a diverged-but-finite EPE (e.g. 2e8) can't be saved as best.
+            if math.isfinite(valEpe) and valEpe < bestVal:
                 bestVal = valEpe
                 saveCheckpoint(args.outDir / "best.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
 
