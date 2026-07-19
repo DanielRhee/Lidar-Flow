@@ -16,6 +16,48 @@ from paths import DEFAULT_CACHE_DIR, DEFAULT_DATASET, DEFAULT_DATASET_DIR
 
 SWEEP_DT = 0.1  # seconds between AV2 sweeps; converts flow magnitude to m/s
 
+# One-time diagnostic dumps for the first non-finite loss / gradient, gated by
+# --debugAnomaly. Keyed so each kind prints exactly once per run.
+_REPORTED_NONFINITE = set()
+
+
+def reportNonFinite(kind, **items):
+    if kind in _REPORTED_NONFINITE:
+        return
+    _REPORTED_NONFINITE.add(kind)
+    print(f"  [debugAnomaly] first non-finite {kind}:", flush=True)
+    for name, t in items.items():
+        if t is None:
+            continue
+        if not torch.is_tensor(t):
+            print(f"    {name}={t}", flush=True)
+            continue
+        t = t.detach().float()
+        nNan = int(torch.isnan(t).sum())
+        nInf = int(torch.isinf(t).sum())
+        finite = t[torch.isfinite(t)]
+        if finite.numel() > 0:
+            lo, hi, amax = finite.min().item(), finite.max().item(), finite.abs().max().item()
+        else:
+            lo = hi = amax = float("nan")
+        print(f"    {name}: shape={tuple(t.shape)} nan={nNan} inf={nInf} "
+              f"min={lo:.4g} max={hi:.4g} absmax={amax:.4g}", flush=True)
+
+
+def reportNonFiniteGrad(model, totalNorm):
+    if "grad" in _REPORTED_NONFINITE:
+        return
+    _REPORTED_NONFINITE.add("grad")
+    print(f"  [debugAnomaly] non-finite grad norm (totalNorm={float(totalNorm):.4g}):", flush=True)
+    bad = []
+    for name, p in model.named_parameters():
+        if p.grad is not None and not torch.isfinite(p.grad).all():
+            g = p.grad.detach()
+            bad.append((name, int(torch.isnan(g).sum()), int(torch.isinf(g).sum())))
+    for name, nNan, nInf in bad[:20]:
+        print(f"    grad {name}: nan={nNan} inf={nInf}", flush=True)
+    print(f"    ({len(bad)} params with non-finite grad)", flush=True)
+
 
 def epeLoss(pred, gt, valid):
     err = torch.linalg.vector_norm(pred.float() - gt.float(), dim=1)
@@ -78,7 +120,7 @@ def setTrainMode(model, phase):
 
 
 def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
-            returnDynamic=False, removeGround=True, loss="deflow"):
+            returnDynamic=False, removeGround=True, loss="deflow", debug=False):
     pc0, pc1 = sample["pc0"], sample["pc1"]
     gtAll = sample["flow"]
     validAll = sample["isValid"]
@@ -115,8 +157,15 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
         return epe, dynEpe, staticEpe, nll
 
     if phase in (2, 3):
-        return betaNllLoss(pred, predLogVar, gt, valid, beta=beta)
-    return deflowLoss(pred, gt, valid) if loss == "deflow" else epeLoss(pred, gt, valid)
+        lossVal = betaNllLoss(pred, predLogVar, gt, valid, beta=beta)
+    else:
+        lossVal = deflowLoss(pred, gt, valid) if loss == "deflow" else epeLoss(pred, gt, valid)
+    if debug and not torch.isfinite(lossVal):
+        # Localize the first non-finite loss: is it pred (activation/weight blow-up)
+        # or a degenerate target? Reported once, then training continues.
+        reportNonFinite("loss", pred=pred, predLogVar=predLogVar, gt=gt,
+                        nValid=int(valid.sum()), nPoints=int(valid.numel()))
+    return lossVal
 
 
 def saveCheckpoint(path, model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args):
@@ -202,10 +251,18 @@ def main():
                         help="linear LR warmup length in epochs before cosine decay")
     parser.add_argument("--weightDecay", type=float, default=1e-4)
     parser.add_argument("--voxelSize", type=float, default=0.2)
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False,
+                        help="OFF by default (fp32). bf16 autocast overflowed spconv's "
+                             "TRAIN-mode implicit-GEMM convolutions once weights grew "
+                             "(max|w| ~7->20 by epoch 9): the decoder convs hit inf, every "
+                             "micro-batch loss went non-finite and was skipped, and the run "
+                             "silently froze (retrain_v3). fp32 is provably stable on those "
+                             "same weights and is nearly free here — training is dataloader-"
+                             "bound and the GPU sits at ~33%. Re-enable at your own risk.")
     parser.add_argument("--ampDtype", choices=["bf16", "fp16"], default="bf16",
-                        help="autocast dtype; bf16 avoids the fp16 overflow/underflow class "
-                             "of bugs and is well supported on Ampere+")
+                        help="autocast dtype when --amp is set. NOTE: bf16 shares fp32's "
+                             "exponent range, so the epoch-9 overflow was spconv accumulating "
+                             "in a narrower range internally, not a true bf16 range overflow")
     parser.add_argument("--accumSteps", type=int, default=8,
                         help="gradient accumulation micro-batches per optimizer step; "
                              "batch_size is fixed at 1 so this sets the effective batch")
@@ -220,6 +277,15 @@ def main():
     parser.add_argument("--resume", type=str, default=None, metavar="PATH|auto")
     parser.add_argument("--checkpointEveryEpochs", type=int, default=5)
     parser.add_argument("--checkpointEverySteps", type=int, default=500)
+    parser.add_argument("--maxSkipFrac", type=float, default=0.5,
+                        help="if the fraction of micro-batches skipped in an epoch "
+                             "(non-finite loss or non-finite grad) exceeds this, treat "
+                             "the run as diverged: reload clean weights, and hard-stop "
+                             "if it recurs for 2 consecutive epochs")
+    parser.add_argument("--debugAnomaly", action="store_true",
+                        help="enable torch.autograd anomaly detection and one-time "
+                             "first-non-finite loss/grad diagnostics; slow, for "
+                             "diagnostic runs only")
     parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=1,
                         help="1 = EPE training; 2 = beta-NLL uncertainty-only training; "
                              "3 = joint flow+uncertainty training (Option B)")
@@ -238,6 +304,11 @@ def main():
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
+    if args.debugAnomaly:
+        # Names the offending op the first time a NaN/Inf is produced in the
+        # forward or backward graph. Raises, so use only for diagnostic runs.
+        torch.autograd.set_detect_anomaly(True)
+        print("debugAnomaly: torch.autograd anomaly detection ENABLED (slow)", flush=True)
     import spconv
     print(
         f"torch={torch.__version__} cuda={torch.version.cuda} "
@@ -347,11 +418,13 @@ def main():
         opt.zero_grad(set_to_none=True)
         pendingMicro = 0
         skipped = 0
+        gradSkips = 0
         for microIdx, sample in enumerate(trainDl):
             with torch.autocast("cuda", dtype=ampDtype, enabled=args.amp):
                 loss = runStep(model, sample, device, args.voxelSize, pointRange,
                                phase=args.phase, beta=args.beta,
-                               removeGround=args.removeGround, loss=args.loss)
+                               removeGround=args.removeGround, loss=args.loss,
+                               debug=args.debugAnomaly)
             if not torch.isfinite(loss):
                 # Skip the bad micro-batch before backward so accumulated grads
                 # stay clean. Do NOT reset BatchNorm running stats here: validation
@@ -369,7 +442,20 @@ def main():
                 continue
 
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Defense in depth: a finite loss can still produce a non-finite
+            # gradient. Under bf16 (or fp32) the GradScaler is a no-op and gives
+            # no inf/nan step-skip, so without this guard clip_grad_norm_ turns one
+            # NaN/Inf grad into NaN over every parameter and AdamW writes NaN into
+            # the weights. Dropping the step keeps the weights clean and lets the
+            # accumulation restart fresh. (clip_grad_norm_ returns the pre-clip norm.)
+            totalNorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not torch.isfinite(totalNorm):
+                if args.debugAnomaly:
+                    reportNonFiniteGrad(model, totalNorm)
+                opt.zero_grad(set_to_none=True)
+                pendingMicro = 0
+                gradSkips += 1
+                continue
             scaler.step(opt)
             scaler.update()
             sched.step()
@@ -384,6 +470,30 @@ def main():
                     args.outDir / "step_latest.pt",
                     model, opt, sched, scaler, epoch, globalStep, bestVal, float("nan"), args,
                 )
+
+        # Circuit-breaker: mass-skipping means the run went numerically unstable.
+        # v3 silently ground through 30 epochs at ~99.6% skip because the only guard
+        # was on val EPE (which stayed finite on a frozen model). Catch it on the
+        # training side: reload clean weights and, if it recurs, hard-stop.
+        skipFrac = (skipped + gradSkips) / max(len(trainDl), 1)
+        if skipFrac > args.maxSkipFrac:
+            consecutiveBadEpochs += 1
+            print(f"  WARNING: epoch {epoch} skipFrac={skipFrac:.3f} "
+                  f"(skipped={skipped} gradSkips={gradSkips} of {len(trainDl)}) "
+                  f"> maxSkipFrac={args.maxSkipFrac} ({consecutiveBadEpochs}/2)", flush=True)
+            if consecutiveBadEpochs >= 2:
+                print("  Hard stop: excessive micro-batch skipping for 2 consecutive epochs.", flush=True)
+                saveCheckpoint(args.outDir / "last.pt", model, opt, sched, scaler,
+                               epoch, globalStep, bestVal, float("nan"), args)
+                break
+            recoverPath = next((c for c in [args.outDir / "best.pt", args.outDir / "last.pt"]
+                                if c.exists()), None)
+            if recoverPath is not None:
+                print(f"  Recovery: reloading clean weights/optimizer from {recoverPath}", flush=True)
+                loadCheckpoint(recoverPath, model, opt, sched, scaler, device, voxelSize=args.voxelSize)
+            else:
+                print("  Recovery: no checkpoint to reload; continuing on current weights.", flush=True)
+            continue  # skip validation/checkpointing on a poisoned epoch
 
         model.eval()
         valEpeSum, valDynSum, valStaticSum, valNllSum = 0.0, 0.0, 0.0, 0.0
@@ -417,6 +527,8 @@ def main():
         peakGb = torch.cuda.max_memory_allocated() / 1e9
         torch.cuda.reset_peak_memory_stats()
         skipMsg = f"  SKIPPED={skipped}" if skipped else ""
+        if gradSkips:
+            skipMsg += f"  GRADSKIP={gradSkips}"
         finMsg = f"  valFinite={valFinite}/{len(valDl)}" if valFinite < len(valDl) else ""
         if args.phase in (2, 3):
             print(f"epoch {epoch}: trainNLL={trainLoss:.4f}  valEPE={valEpe:.4f}  "

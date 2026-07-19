@@ -135,7 +135,7 @@ def main():
         rangeM = np.linalg.norm(xyzMasked, axis=1).astype(np.float32)
 
         # index flow fields with CPU bool tensor (consistent with PyTorch)
-        gtFlow = gtAll[mask0T].float()
+        gtFlow = gtAll[mask0T].detach().float()
         isValid = validAll[mask0T].numpy().astype(bool)
         isDynamic = dynAll[mask0T].numpy().astype(bool)
         catIdx = catAll[mask0T].numpy()
