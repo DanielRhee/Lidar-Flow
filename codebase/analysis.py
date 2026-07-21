@@ -201,7 +201,9 @@ def sparsificationAndAuse(dfA, dfB, outDir):
 
             predCurve, fracs = sparsifyCurve(errMag, sigma)
             oracleCurve, _ = sparsifyCurve(errMag, errMag)
-            ause = float(np.trapz(predCurve - oracleCurve, fracs))
+            # np.trapz was removed in numpy 2.0; np.trapezoid is the replacement.
+            trapz = getattr(np, "trapezoid", None) or np.trapz
+            ause = float(trapz(predCurve - oracleCurve, fracs))
 
             ax.plot(fracs, predCurve, color=col, linewidth=1.8, label=f"{label} (AUSE={ause:.4f})")
             ax.plot(fracs, oracleCurve, color=col, linewidth=1.0, linestyle="--", alpha=0.5)

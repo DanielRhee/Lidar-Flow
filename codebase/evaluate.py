@@ -135,6 +135,8 @@ def main():
         rangeM = np.linalg.norm(xyzMasked, axis=1).astype(np.float32)
 
         # index flow fields with CPU bool tensor (consistent with PyTorch)
+        # detach: the cached flow tensors carry requires_grad=True (a cache-gen
+        # artifact), which is harmless in training but breaks .numpy() below.
         gtFlow = gtAll[mask0T].detach().float()
         isValid = validAll[mask0T].numpy().astype(bool)
         isDynamic = dynAll[mask0T].numpy().astype(bool)
