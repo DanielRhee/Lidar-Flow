@@ -7,14 +7,18 @@ import time
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
-from dataset import DiskCachedDataset, identityCollate, loadSplitIndices
-from model import SparseFlowNet, runForward, runForwardFeatures, runForwardHeads
+from dataset import buildCachedSubset, identityCollate, loadIndexMap
+from model import SparseFlowNet, loadModelWeights, runForward, runForwardFeatures, runForwardHeads
 from paths import DEFAULT_CACHE_DIR, DEFAULT_DATASET, DEFAULT_DATASET_DIR
 
 
 SWEEP_DT = 0.1  # seconds between AV2 sweeps; converts flow magnitude to m/s
+
+# chi2(0.90, df=3): squared error over variance below this is a covered point under
+# an isotropic 3-D Gaussian. Matches analysis.py's coverage definition.
+_CHI2_90_DF3 = 6.251388631170325
 
 # One-time diagnostic dumps for the first non-finite loss / gradient, gated by
 # --debugAnomaly. Keyed so each kind prints exactly once per run.
@@ -108,14 +112,23 @@ def betaNllLoss(pred, predLogVar, gt, valid, beta=0.5):
     return validWeighted.sum() / valid.sum().clamp(min=1).float()
 
 
+# Phase 2 fits only the uncertainty head, so the flow path stays bit-identical to
+# the phase-1 checkpoint; phase 3 fine-tunes the flow heads alongside it.
+def trainablePrefixes(phase):
+    if phase == 2:
+        return ("uncertaintyHead.",)
+    return ("head.", "refineHead.", "uncertaintyHead.")
+
+
 def setTrainMode(model, phase):
     model.train()
     if phase not in (2, 3):
         return
+    trainable = tuple(p.rstrip(".") for p in trainablePrefixes(phase))
     for name, m in model.named_modules():
         if not name:
             continue
-        if name.split(".")[0] not in ("head", "refineHead", "uncertaintyHead"):
+        if name.split(".")[0] not in trainable:
             m.eval()
 
 
@@ -134,12 +147,14 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
         pc0, pc1 = pc0[keep0], pc1[keep1]
         gtAll, validAll, dynamicAll = gtAll[keep0], validAll[keep0], dynamicAll[keep0]
 
-    # phase 3 training uses partial no_grad: backbone under no_grad, heads with autograd
-    if phase == 3 and not returnDynamic:
+    # Phases 2 and 3 use partial no_grad: backbone under no_grad, heads with
+    # autograd. The frozen heads need no special handling -- requires_grad=False on
+    # their parameters plus a grad-free d0 already keeps them out of the graph.
+    if phase in (2, 3) and not returnDynamic:
         with torch.no_grad():
-            d0, pc0ToUnion, inv0Point, mask0, rel0Point = runForwardFeatures(
+            d0, pc0ToUnion, inv0Point, mask0, rel0Point, xyz0Point = runForwardFeatures(
                 model, pc0, pc1, voxelSize, pointRange, device)
-        pred, predLogVar = runForwardHeads(model, d0, pc0ToUnion, inv0Point, rel0Point)
+        pred, predLogVar = runForwardHeads(model, d0, pc0ToUnion, inv0Point, rel0Point, xyz0Point)
     else:
         pred, predLogVar, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
 
@@ -147,14 +162,38 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
     valid = validAll.to(device, non_blocking=True)[mask0]
 
     if returnDynamic:
-        epe = epeLoss(pred, gt, valid)
+        nan = torch.tensor(float("nan"), device=device)
         dyn = dynamicAll.to(device, non_blocking=True)[mask0]
-        dynValid = valid & dyn
-        staticValid = valid & ~dyn
-        dynEpe = epeLoss(pred, gt, dynValid) if dynValid.any() else torch.tensor(float("nan"), device=device)
-        staticEpe = epeLoss(pred, gt, staticValid) if staticValid.any() else torch.tensor(float("nan"), device=device)
-        nll = betaNllLoss(pred, predLogVar, gt, valid, beta=beta) if phase in (2, 3) else torch.tensor(float("nan"), device=device)
-        return epe, dynEpe, staticEpe, nll
+        dynValid, staticValid = valid & dyn, valid & ~dyn
+        metrics = {
+            "epe": epeLoss(pred, gt, valid),
+            "dynEpe": epeLoss(pred, gt, dynValid) if dynValid.any() else nan,
+            "staticEpe": epeLoss(pred, gt, staticValid) if staticValid.any() else nan,
+        }
+        if phase not in (2, 3) or not valid.any():
+            metrics.update(nll=nan, nllMed=nan, sigma=nan, cover90=nan)
+            return metrics
+        logVar = predLogVar.float()[valid]
+        var = torch.exp(logVar)
+        sqErr = ((pred.float() - gt.float()) ** 2).sum(dim=1)[valid]
+        # beta=0 on purpose: a reported score must be *proper*. The beta-weighted
+        # value is not a progress measure at all, because its detached var**beta
+        # weight shrinks as sigma converges -- for a static point moving var
+        # 1e-3 -> its optimum 3e-6 the weighted loss RISES -0.327 -> -0.030 while
+        # the proper NLL correctly falls -10.36 -> -17.56.
+        pointNll = 0.5 * sqErr / var + 1.5 * logVar
+        # nllMed, not nll, is what best_nll.pt selects on. The *mean* proper NLL is
+        # unbounded above and a handful of catastrophically overconfident points
+        # dominate it (sqErr 1 m^2 at the sigma floor contributes ~5e6), so it
+        # cannot tell "well calibrated" from "well calibrated plus three bad
+        # points" and rises monotonically even while calibration improves. The
+        # median is robust and still rewards sharpness, unlike cover90, which a
+        # constant sigma tuned to the target would score perfectly on.
+        metrics["nll"] = pointNll.mean()
+        metrics["nllMed"] = pointNll.median()
+        metrics["sigma"] = var.sqrt().mean()
+        metrics["cover90"] = (sqErr / var <= _CHI2_90_DF3).float().mean()
+        return metrics
 
     if phase in (2, 3):
         lossVal = betaNllLoss(pred, predLogVar, gt, valid, beta=beta)
@@ -237,6 +276,11 @@ def main():
     parser.add_argument("--datasetDir", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--cacheDir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument("--fitSet", default="train", choices=["train", "uncFit"],
+                        help="frozen index set to train on; uncFit is the val+pseudoTest "
+                             "carve the uncertainty head is calibrated against")
+    parser.add_argument("--evalSet", default="val", choices=["val", "pseudoTest", "uncHoldout"],
+                        help="frozen index set to evaluate on each epoch")
     parser.add_argument("--trainSamples", type=int, default=-1,
                         help="cap number of training samples; -1 uses the full cached set")
     parser.add_argument("--valSamples", type=int, default=-1,
@@ -268,9 +312,10 @@ def main():
                              "batch_size is fixed at 1 so this sets the effective batch")
     parser.add_argument("--loss", choices=["deflow", "epe"], default="deflow",
                         help="phase-1 loss; deflow is the speed-binned DeFlow loss")
-    parser.add_argument("--numWorkers", type=int, default=12,
-                        help="dataloader workers; training is dataloader-bound, so this "
-                             "is the main throughput knob on this box (18 cores)")
+    parser.add_argument("--numWorkers", type=int, default=6,
+                        help="dataloader workers. NOT the throughput knob: cache reads "
+                             "cost ~4 ms/sample and 4/6/8/12 all land within 10%. What "
+                             "mattered was torch.set_num_threads(1) below")
     parser.add_argument("--removeGround", action=argparse.BooleanOptionalAction, default=True,
                         help="drop map-derived ground points before voxelization")
     parser.add_argument("--outDir", type=Path, default=Path("runs/mvp"))
@@ -287,13 +332,19 @@ def main():
                              "first-non-finite loss/grad diagnostics; slow, for "
                              "diagnostic runs only")
     parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=1,
-                        help="1 = EPE training; 2 = beta-NLL uncertainty-only training; "
+                        help="1 = EPE training; 2 = beta-NLL uncertainty-only training, "
+                             "flow path frozen bit-identical; "
                              "3 = joint flow+uncertainty training (Option B)")
     parser.add_argument("--beta", type=float, default=0.5,
-                        help="beta for beta-NLL loss (phases 2 and 3)")
+                        help="beta for beta-NLL loss (phases 2 and 3). The weight is "
+                             "var.detach()**beta, and being detached it leaves the "
+                             "per-point optimum at the proper-NLL var=sqErr/3 and only "
+                             "reweights points: at 0.5 the weight is proportional to "
+                             "sigma, which up-weights dynamic points ~16x over static, "
+                             "the same rebalancing deflowLoss does for phase 1")
     parser.add_argument("--phase1Ckpt", type=Path, default=None,
                         help="checkpoint to load weights from for phases 2 and 3; "
-                             "strict=False so uncertaintyHead keeps its init")
+                             "uncertaintyHead.* is dropped so it keeps its init")
     parser.add_argument("--flowLr", type=float, default=5e-5,
                         help="learning rate for flow head in phase 3 (default: 5e-5)")
     parser.add_argument("--epeBase", type=float, default=None,
@@ -304,6 +355,12 @@ def main():
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
+    # One intra-op thread, set before the DataLoaders so workers inherit it. torch
+    # defaults to one thread per core (18 here); with batch_size=1 sparse convs
+    # every kernel takes microseconds, so the CUDA launch thread is the critical
+    # path, and 18-way contention across the main process and every worker starved
+    # it. Measured 15.6 -> 67 samp/s, a 4.3x speedup. See memory.md.
+    torch.set_num_threads(1)
     if args.debugAnomaly:
         # Names the offending op the first time a NaN/Inf is produced in the
         # forward or backward graph. Raises, so use only for diagnostic runs.
@@ -318,18 +375,15 @@ def main():
     args.outDir.mkdir(parents=True, exist_ok=True)
 
     cacheDir = args.cacheDir
-    trainBase = DiskCachedDataset("train", cacheDir)
-    valBase = DiskCachedDataset("val", cacheDir)
-    trainIdx = loadSplitIndices("train")
-    valIdx = loadSplitIndices("val")
-    if args.trainSamples > 0:
-        trainIdx = trainIdx[:args.trainSamples]
-    if args.valSamples > 0:
-        valIdx = valIdx[:args.valSamples]
-    trainDs = Subset(trainBase, trainIdx)
-    valDs = Subset(trainBase, trainIdx) if args.overfit else Subset(valBase, valIdx)
-    valSource = "train (overfit probe)" if args.overfit else "val"
-    print(f"using {len(trainDs)} train / {len(valDs)} {valSource} samples from cache")
+    trainMap = loadIndexMap(args.fitSet)
+    trainDs = buildCachedSubset(trainMap, cacheDir, args.trainSamples)
+    if args.overfit:
+        valDs = buildCachedSubset(trainMap, cacheDir, args.trainSamples)
+        valSource = f"{args.fitSet} (overfit probe)"
+    else:
+        valDs = buildCachedSubset(loadIndexMap(args.evalSet), cacheDir, args.valSamples)
+        valSource = args.evalSet
+    print(f"using {len(trainDs)} {args.fitSet} / {len(valDs)} {valSource} samples from cache")
 
     # Training is dataloader-bound, not GPU-bound: each sample is a ~2.2 MB
     # torch.load + unpickle, and the GPU idles without enough workers feeding it.
@@ -349,12 +403,13 @@ def main():
         if args.phase1Ckpt is None:
             raise SystemExit(f"--phase {args.phase} requires --phase1Ckpt PATH")
         ckpt = torch.load(args.phase1Ckpt, map_location=device, weights_only=False)
-        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        dropped, missing, unexpected = loadModelWeights(model, ckpt["model"])
         print(f"loaded phase-1 weights from {args.phase1Ckpt}")
-        print(f"  missing keys (expected uncertaintyHead.*): {list(missing)}")
-        print(f"  unexpected keys (should be empty): {list(unexpected)}")
+        print(f"  dropped on shape mismatch (expected uncertaintyHead.* only): {dropped}")
+        print(f"  missing keys (expected uncertaintyHead.*): {missing}")
+        print(f"  unexpected keys (should be empty): {unexpected}")
         for name, p in model.named_parameters():
-            if not name.startswith(("head.", "refineHead.", "uncertaintyHead.")):
+            if not name.startswith(trainablePrefixes(args.phase)):
                 p.requires_grad = False
         nTrainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         nTotal = sum(p.numel() for p in model.parameters())
@@ -496,32 +551,31 @@ def main():
             continue  # skip validation/checkpointing on a poisoned epoch
 
         model.eval()
-        valEpeSum, valDynSum, valStaticSum, valNllSum = 0.0, 0.0, 0.0, 0.0
-        valEpeN, valDynN, valStaticN, valNllN = 0, 0, 0, 0
+        # Per-metric counts, because a sample can be finite in EPE but have no
+        # dynamic points at all; averaging over its own finite count keeps one
+        # missing stratum from poisoning the others.
+        valSums, valCounts = {}, {}
         with torch.no_grad():
             for sample in valDl:
                 with torch.autocast("cuda", dtype=ampDtype, enabled=args.amp):
-                    epe, dynEpe, staticEpe, nll = runStep(
+                    metrics = runStep(
                         model, sample, device, args.voxelSize, pointRange,
                         phase=args.phase, beta=args.beta, returnDynamic=True,
                         removeGround=args.removeGround, loss=args.loss)
-                if torch.isfinite(epe):
-                    valEpeSum += epe.item(); valEpeN += 1
-                if torch.isfinite(dynEpe):
-                    valDynSum += dynEpe.item(); valDynN += 1
-                if torch.isfinite(staticEpe):
-                    valStaticSum += staticEpe.item(); valStaticN += 1
-                if torch.isfinite(nll):
-                    valNllSum += nll.item(); valNllN += 1
+                for name, value in metrics.items():
+                    if torch.isfinite(value):
+                        valSums[name] = valSums.get(name, 0.0) + value.item()
+                        valCounts[name] = valCounts.get(name, 0) + 1
+
+        def valMean(name):
+            # nan (not 0) when nothing was finite, so divergence stays loud (see §9).
+            return valSums[name] / valCounts[name] if valCounts.get(name) else float("nan")
 
         trainLoss = trainSumDev.item() / max(trainN, 1)
-        # nan (not 0) when every val sample was non-finite, so divergence is loud
-        # rather than masked as a perfect score.
-        valEpe = valEpeSum / valEpeN if valEpeN > 0 else float("nan")
-        valDynEpe = valDynSum / valDynN if valDynN > 0 else float("nan")
-        valStaticEpe = valStaticSum / valStaticN if valStaticN > 0 else float("nan")
-        valNll = valNllSum / valNllN if valNllN > 0 else float("nan")
-        valFinite = valEpeN
+        valEpe, valDynEpe, valStaticEpe = valMean("epe"), valMean("dynEpe"), valMean("staticEpe")
+        valNll, valSigma, valCover90 = valMean("nll"), valMean("sigma"), valMean("cover90")
+        valNllMed = valMean("nllMed")
+        valFinite = valCounts.get("epe", 0)
         dt = time.time() - t0
 
         peakGb = torch.cuda.max_memory_allocated() / 1e9
@@ -533,11 +587,13 @@ def main():
         if args.phase in (2, 3):
             print(f"epoch {epoch}: trainNLL={trainLoss:.4f}  valEPE={valEpe:.4f}  "
                   f"valDynEPE={valDynEpe:.4f}  valStaticEPE={valStaticEpe:.4f}  "
-                  f"valNLL={valNll:.4f}  dt={dt:.1f}s  peakVram={peakGb:.2f}GB{skipMsg}{finMsg}")
+                  f"valNLLmed={valNllMed:.4f}  valNLL={valNll:.4f}  "
+                  f"valSigma={valSigma:.5f}  valCover90={valCover90:.4f}  "
+                  f"dt={dt:.1f}s  peakVram={peakGb:.2f}GB{skipMsg}{finMsg}", flush=True)
         else:
             print(f"epoch {epoch}: trainLoss={trainLoss:.4f}  valEPE={valEpe:.4f}  "
                   f"valDynEPE={valDynEpe:.4f}  valStaticEPE={valStaticEpe:.4f}  "
-                  f"dt={dt:.1f}s  peakVram={peakGb:.2f}GB{skipMsg}{finMsg}")
+                  f"dt={dt:.1f}s  peakVram={peakGb:.2f}GB{skipMsg}{finMsg}", flush=True)
 
         # Divergence guard: a non-finite val EPE means the model blew up. Abort
         # after two in a row rather than burning the rest of the run.
@@ -558,10 +614,10 @@ def main():
         if args.phase == 3:
             if valEpe < bestVal:
                 bestVal = valEpe
-            if not math.isnan(valNll) and valNll < bestNll and valEpe <= 1.05 * epeBase:
-                bestNll = valNll
+            if not math.isnan(valNllMed) and valNllMed < bestNll and valEpe <= 1.05 * epeBase:
+                bestNll = valNllMed
                 saveCheckpoint(args.outDir / "best.pt", model, opt, sched, scaler, epoch, globalStep, bestNll, valEpe, args)
-                print(f"  saved best.pt (valNLL={bestNll:.4f}, valEPE={valEpe:.4f})")
+                print(f"  saved best.pt (valNLLmed={bestNll:.4f}, valEPE={valEpe:.4f})")
             if valEpe > 1.10 * epeBase:
                 consecutiveBadEpochs += 1
                 print(f"  WARNING: valEPE {valEpe:.4f} > hard-stop threshold {1.10 * epeBase:.4f} "
@@ -575,8 +631,9 @@ def main():
             if math.isfinite(valEpe) and valEpe < bestVal:
                 bestVal = valEpe
                 saveCheckpoint(args.outDir / "best_epe.pt", model, opt, sched, scaler, epoch, globalStep, bestVal, valEpe, args)
-            if math.isfinite(valNll) and valNll < bestNll:
-                bestNll = valNll
+            # Median, not mean: see the note in runStep.
+            if math.isfinite(valNllMed) and valNllMed < bestNll:
+                bestNll = valNllMed
                 saveCheckpoint(args.outDir / "best_nll.pt", model, opt, sched, scaler, epoch, globalStep, bestNll, valEpe, args)
         else:
             # isfinite guard so a diverged-but-finite EPE (e.g. 2e8) can't be saved as best.
@@ -591,7 +648,7 @@ def main():
             )
 
     if args.phase in (2, 3):
-        print(f"best valEPE: {bestVal:.4f}  best valNLL: {bestNll:.4f}")
+        print(f"best valEPE: {bestVal:.4f}  best valNLLmed: {bestNll:.4f}")
     else:
         print(f"best valEPE: {bestVal:.4f}")
 

@@ -10,10 +10,10 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 import torch
 from scipy.spatial import cKDTree
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
-from dataset import loadSplitIndices
-from model import SparseFlowNet, runForward
+from dataset import buildCachedSubset, loadIndexMap
+from model import SparseFlowNet, loadModelWeights, runForward
 from paths import DEFAULT_CACHE_DIR
 
 _SCHEMA = pa.schema([
@@ -30,22 +30,14 @@ def _identityCollate(batch):
     return batch[0]
 
 
-class ValCacheDataset(Dataset):
-    def __init__(self, cacheDir, indices, split="val"):
-        self.dir = Path(cacheDir) / split
-        self.indices = indices
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, i):
-        return torch.load(self.dir / f"{self.indices[i]}.pt", weights_only=False)
-
-
 def loadModel(checkpointPath, device):
     model = SparseFlowNet(inC=8).to(device)
     ckpt = torch.load(checkpointPath, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    dropped, missing, unexpected = loadModelWeights(model, ckpt["model"])
+    if dropped or missing or unexpected:
+        # A pre-uncertainty checkpoint: sigma stays at its constant init, which makes
+        # it the constant-sigma control for a sigma-only A/B against a phase-2 run.
+        print(f"  dropped={dropped} missing={missing} unexpected={unexpected}", flush=True)
     model.eval()
     return model, ckpt.get("voxelSize")
 
@@ -58,7 +50,8 @@ def main():
     parser.add_argument("--cacheDir", type=Path, default=DEFAULT_CACHE_DIR)
     parser.add_argument("--outFile", type=Path, required=True)
     parser.add_argument("--valSamples", type=int, default=-1)
-    parser.add_argument("--split", default="val", choices=["val", "pseudoTest"])
+    parser.add_argument("--split", default="val",
+                        choices=["val", "pseudoTest", "uncFit", "uncHoldout"])
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ampDtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--removeGround", action=argparse.BooleanOptionalAction, default=True)
@@ -66,6 +59,9 @@ def main():
 
     device = torch.device("cuda")
     torch.backends.cudnn.benchmark = True
+    # See train.py: 18-way intra-op thread contention starves the CUDA launch
+    # thread, which is the critical path for batch_size=1 sparse convs.
+    torch.set_num_threads(1)
     pointRange = [-70.0, -70.0, -3.0, 70.0, 70.0, 3.0]
 
     args.outFile.parent.mkdir(parents=True, exist_ok=True)
@@ -81,15 +77,11 @@ def main():
     ampDtype = torch.bfloat16 if args.ampDtype == "bf16" else torch.float16
     print(f"loaded {args.checkpoint} (voxelSize={args.voxelSize})", flush=True)
 
-    valIdx = loadSplitIndices(args.split)
-    if args.valSamples > 0:
-        valIdx = valIdx[:args.valSamples]
-
-    ds = ValCacheDataset(args.cacheDir, valIdx, args.split)
+    ds = buildCachedSubset(loadIndexMap(args.split), args.cacheDir, args.valSamples)
     dl = DataLoader(ds, batch_size=1, shuffle=False, num_workers=2,
                     persistent_workers=True, pin_memory=True, prefetch_factor=2,
                     collate_fn=_identityCollate)
-    print(f"running on {len(valIdx)} val sweeps", flush=True)
+    print(f"running on {len(ds)} {args.split} sweeps", flush=True)
 
     cols = {k: [] for k in (
         "predFlowX", "predFlowY", "predFlowZ", "predSigma",

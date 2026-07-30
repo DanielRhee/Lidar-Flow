@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset, Subset
 
 from extractSceneflow import buildLoader, loadAnnotation
 from paths import SPLITS_FILE
@@ -43,13 +43,44 @@ class DiskCachedDataset(Dataset):
         path = self.cacheDir / f"{idx}.pt"
         if not path.exists():
             raise FileNotFoundError(f"sample {idx} not in cache at {path}; run populate.py first")
-        return torch.load(path, weights_only=False)
+        sample = torch.load(path, weights_only=False)
+        # populate.py wrote pc1 and flow with requires_grad=True (a cache-gen
+        # artifact). Left set, the GT flow joins the autograd graph and backward
+        # spends itself computing gradients *into the targets*: measured 10.7 ms
+        # vs 0.9 ms per sample in phase 2. detach() returns a view, so this is free.
+        return {k: v.detach() if torch.is_tensor(v) else v for k, v in sample.items()}
 
 
 def loadSplitIndices(split, splitsFile=SPLITS_FILE):
     """Loader indices for a frozen split ('train' | 'val' | 'pseudoTest')."""
     key = {"train": "trainIndices", "val": "valIndices", "pseudoTest": "pseudoTestIndices"}[split]
     return json.loads(Path(splitsFile).read_text())[key]
+
+
+def loadIndexMap(name, splitsFile=SPLITS_FILE):
+    """{sourceSplit: [loaderIdx]} for any frozen set, including the derived ones.
+
+    'uncFit' / 'uncHoldout' are the log-level carve of val + pseudoTest the
+    uncertainty head is calibrated on, so they span two source splits at once.
+    """
+    if name in ("uncFit", "uncHoldout"):
+        return json.loads(Path(splitsFile).read_text())[f"{name}Indices"]
+    return {name: loadSplitIndices(name, splitsFile)}
+
+
+def buildCachedSubset(indexMap, cacheDir, cap=-1):
+    """Concat one cached Subset per source split.
+
+    Concat rather than merge because pseudoTest indices are *train*-loader indices
+    and collide numerically with val's, so each split keeps its own cache dir.
+    A cap strides evenly so a capped probe still covers every source split.
+    """
+    ds = ConcatDataset([Subset(DiskCachedDataset(split, cacheDir), indices)
+                        for split, indices in sorted(indexMap.items()) if indices])
+    if 0 < cap < len(ds):
+        stride = len(ds) / cap
+        ds = Subset(ds, [int(i * stride) for i in range(cap)])
+    return ds
 
 
 def identityCollate(batch):
