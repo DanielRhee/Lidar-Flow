@@ -22,6 +22,11 @@ _SCHEMA = pa.schema([
     ("gtFlowX", pa.float32()), ("gtFlowY", pa.float32()), ("gtFlowZ", pa.float32()),
     ("isDynamic", pa.bool_()), ("classIdx", pa.uint8()),
     ("rangeMeters", pa.float32()), ("density", pa.uint16()),
+    # Log identity, so downstream tooling can group by log. Points within a sweep are
+    # heavily dependent, so the log is the exchangeable unit: every honest confidence
+    # interval, bootstrap and conformal split has to be taken at this level, and none
+    # of that was possible while the dump was a flat bag of points.
+    ("logIdx", pa.uint16()),
 ])
 _FLUSH_EVERY = 500
 
@@ -86,18 +91,22 @@ def main():
     cols = {k: [] for k in (
         "predFlowX", "predFlowY", "predFlowZ", "predSigma",
         "gtFlowX", "gtFlowY", "gtFlowZ",
-        "isDynamic", "classIdx", "rangeMeters", "density",
+        "isDynamic", "classIdx", "rangeMeters", "density", "logIdx",
     )}
 
     tmpPath = args.outFile.parent / (args.outFile.name + ".tmp")
     totalPoints = 0
     writer = ipc.new_file(str(tmpPath), _SCHEMA)
+    # Compact log index, assigned in first-seen order. The cache already stores
+    # uuid = (logId, timestamp), so no dataset access is needed.
+    logIds = {}
 
     t0 = time.time()
     for i, sample in enumerate(dl):
         pc0, pc1 = sample["pc0"], sample["pc1"]
         gtAll, validAll = sample["flow"], sample["isValid"]
         dynAll, catAll = sample["isDynamic"], sample["categoryIndices"]
+        logIdx = logIds.setdefault(sample["uuid"][0], len(logIds))
 
         # Must mirror training: filter ground before voxelization, and subset the
         # per-point GT identically so mask0 lines up.
@@ -148,6 +157,7 @@ def main():
         cols["classIdx"].append(catIdx.astype(np.uint8)[isValid])
         cols["rangeMeters"].append(rangeM[isValid])
         cols["density"].append(density.astype(np.uint16)[isValid])
+        cols["logIdx"].append(np.full(int(isValid.sum()), logIdx, dtype=np.uint16))
 
         if (i + 1) % _FLUSH_EVERY == 0 or i == len(dl) - 1:
             if any(len(v) > 0 for v in cols.values()):
@@ -163,6 +173,7 @@ def main():
                     "classIdx": np.concatenate(cols["classIdx"]).astype(np.uint8),
                     "rangeMeters": np.concatenate(cols["rangeMeters"]).astype(np.float32),
                     "density": np.concatenate(cols["density"]).astype(np.uint16),
+                    "logIdx": np.concatenate(cols["logIdx"]).astype(np.uint16),
                 }, schema=_SCHEMA)
                 totalPoints += batch.num_rows
                 writer.write_batch(batch)
@@ -177,7 +188,7 @@ def main():
 
     writer.close()
     tmpPath.rename(args.outFile)
-    print(f"wrote {totalPoints:,} valid points → {args.outFile}", flush=True)
+    print(f"wrote {totalPoints:,} valid points over {len(logIds)} logs → {args.outFile}", flush=True)
 
 
 if __name__ == "__main__":

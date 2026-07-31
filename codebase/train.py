@@ -120,6 +120,23 @@ def trainablePrefixes(phase):
     return ("head.", "refineHead.", "uncertaintyHead.")
 
 
+def sigmaRegressionLoss(pred, predLogVar, gt, valid, floor=1e-4):
+    """Oracle-style ceiling: regress log sigma straight onto the per-point NLL optimum.
+
+    log(|e|/sqrt(3)) is exactly the sigma that minimises the isotropic 3-D Gaussian
+    NLL for a single point, so fitting it under plain MSE *in log space* asks the head
+    for the same target as NLL but without the 1/var term that lets the error tail own
+    the gradient. Whatever this reaches therefore bounds what any head built on these
+    frozen features can achieve -- which is the test for whether the near-constant
+    sigma over BACKGROUND is a head failure or an information limit.
+    """
+    err = torch.linalg.vector_norm(pred.float() - gt.float(), dim=1).clamp(min=floor)
+    diff = (0.5 * predLogVar.float() - torch.log(err / math.sqrt(3.0)))[valid]
+    if diff.numel() == 0:
+        return diff.sum() * 0.0
+    return (diff ** 2).mean()
+
+
 def setTrainMode(model, phase):
     model.train()
     if phase not in (2, 3):
@@ -133,7 +150,8 @@ def setTrainMode(model, phase):
 
 
 def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
-            returnDynamic=False, removeGround=True, loss="deflow", debug=False):
+            returnDynamic=False, removeGround=True, loss="deflow", debug=False,
+            sigmaTarget="nll"):
     pc0, pc1 = sample["pc0"], sample["pc1"]
     gtAll = sample["flow"]
     validAll = sample["isValid"]
@@ -196,7 +214,8 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
         return metrics
 
     if phase in (2, 3):
-        lossVal = betaNllLoss(pred, predLogVar, gt, valid, beta=beta)
+        lossVal = (sigmaRegressionLoss(pred, predLogVar, gt, valid) if sigmaTarget == "logErr"
+                   else betaNllLoss(pred, predLogVar, gt, valid, beta=beta))
     else:
         lossVal = deflowLoss(pred, gt, valid) if loss == "deflow" else epeLoss(pred, gt, valid)
     if debug and not torch.isfinite(lossVal):
@@ -335,6 +354,11 @@ def main():
                         help="1 = EPE training; 2 = beta-NLL uncertainty-only training, "
                              "flow path frozen bit-identical; "
                              "3 = joint flow+uncertainty training (Option B)")
+    parser.add_argument("--sigmaTarget", choices=["nll", "logErr"], default="nll",
+                        help="phase-2/3 sigma objective. 'logErr' regresses log sigma onto "
+                             "log(|e|/sqrt(3)) under MSE in log space instead of using NLL: "
+                             "an oracle-style ceiling on what any head can extract from the "
+                             "frozen features, with no 1/var term for the tail to dominate")
     parser.add_argument("--beta", type=float, default=0.5,
                         help="beta for beta-NLL loss (phases 2 and 3). The weight is "
                              "var.detach()**beta, and being detached it leaves the "
@@ -479,6 +503,7 @@ def main():
                 loss = runStep(model, sample, device, args.voxelSize, pointRange,
                                phase=args.phase, beta=args.beta,
                                removeGround=args.removeGround, loss=args.loss,
+                               sigmaTarget=args.sigmaTarget,
                                debug=args.debugAnomaly)
             if not torch.isfinite(loss):
                 # Skip the bad micro-batch before backward so accumulated grads
@@ -561,7 +586,8 @@ def main():
                     metrics = runStep(
                         model, sample, device, args.voxelSize, pointRange,
                         phase=args.phase, beta=args.beta, returnDynamic=True,
-                        removeGround=args.removeGround, loss=args.loss)
+                        removeGround=args.removeGround, loss=args.loss,
+                        sigmaTarget=args.sigmaTarget)
                 for name, value in metrics.items():
                     if torch.isfinite(value):
                         valSums[name] = valSums.get(name, 0.0) + value.item()
