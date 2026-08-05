@@ -65,6 +65,27 @@ def loadIndexMap(name, splitsFile=SPLITS_FILE):
     """
     if name in ("uncFit", "uncHoldout"):
         return json.loads(Path(splitsFile).read_text())[f"{name}Indices"]
+    # uncFold<k>Fit / uncFold<k>Eval: cross-fitting over all 220 val+pseudoTest logs so
+    # every log carries an out-of-fold sigma. Only the eval maps are stored; the fit
+    # side is the union of the other folds.
+    if name.startswith("uncFold"):
+        rest = name[len("uncFold"):]
+        if rest.endswith("Eval"):
+            k, role = int(rest[:-4]), "Eval"
+        elif rest.endswith("Fit"):
+            k, role = int(rest[:-3]), "Fit"
+        else:
+            raise KeyError(f"expected uncFold<k>Fit or uncFold<k>Eval, got {name!r}")
+        folds = json.loads(Path(splitsFile).read_text())["uncFoldEvalIndices"]
+        if role == "Eval":
+            return folds[k]
+        merged = {}
+        for j, m in enumerate(folds):
+            if j == k:
+                continue
+            for split, idxs in m.items():
+                merged.setdefault(split, []).extend(idxs)
+        return {split: sorted(v) for split, v in merged.items()}
     return {name: loadSplitIndices(name, splitsFile)}
 
 

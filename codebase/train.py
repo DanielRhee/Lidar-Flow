@@ -10,15 +10,21 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import buildCachedSubset, identityCollate, loadIndexMap
-from model import SparseFlowNet, loadModelWeights, runForward, runForwardFeatures, runForwardHeads
+from model import (SparseFlowNet, loadModelWeights, runFailureHead, runForward,
+                   runForwardFeatures, runForwardHeads)
 from paths import DEFAULT_CACHE_DIR, DEFAULT_DATASET, DEFAULT_DATASET_DIR
 
+
+from failureDetection import rocAuc
 
 SWEEP_DT = 0.1  # seconds between AV2 sweeps; converts flow magnitude to m/s
 
 # chi2(0.90, df=3): squared error over variance below this is a covered point under
 # an isotropic 3-D Gaussian. Matches analysis.py's coverage definition.
 _CHI2_90_DF3 = 6.251388631170325
+
+# Points kept per val sweep for the pooled ROC-AUC.
+_COLLECT_PER_SAMPLE = 600
 
 # One-time diagnostic dumps for the first non-finite loss / gradient, gated by
 # --debugAnomaly. Keyed so each kind prints exactly once per run.
@@ -114,10 +120,24 @@ def betaNllLoss(pred, predLogVar, gt, valid, beta=0.5):
 
 # Phase 2 fits only the uncertainty head, so the flow path stays bit-identical to
 # the phase-1 checkpoint; phase 3 fine-tunes the flow heads alongside it.
-def trainablePrefixes(phase):
+def trainablePrefixes(phase, objective="nll"):
+    if objective == "failure":
+        return ("failureHead.",)          # flow AND sigma frozen; only pi trains
     if phase == 2:
         return ("uncertaintyHead.",)
     return ("head.", "refineHead.", "uncertaintyHead.")
+
+
+def failureLoss(logit, pred, gt, valid, tau):
+    """BCE on P(||e|| > tau). No clamp, no sqrt(3), no chi-squared, and no 1/var term for
+    the tail to dominate -- the pathologies of the scalar-Gaussian formulation are
+    properties of that likelihood, not of the problem."""
+    err = torch.linalg.vector_norm(pred.float() - gt.float(), dim=1)
+    target = (err > tau).float()[valid]
+    z = logit.float()[valid]
+    if z.numel() == 0:
+        return z.sum() * 0.0
+    return torch.nn.functional.binary_cross_entropy_with_logits(z, target)
 
 
 def sigmaRegressionLoss(pred, predLogVar, gt, valid, floor=1e-4):
@@ -137,11 +157,11 @@ def sigmaRegressionLoss(pred, predLogVar, gt, valid, floor=1e-4):
     return (diff ** 2).mean()
 
 
-def setTrainMode(model, phase):
+def setTrainMode(model, phase, objective="nll"):
     model.train()
     if phase not in (2, 3):
         return
-    trainable = tuple(p.rstrip(".") for p in trainablePrefixes(phase))
+    trainable = tuple(p.rstrip(".") for p in trainablePrefixes(phase, objective))
     for name, m in model.named_modules():
         if not name:
             continue
@@ -151,11 +171,12 @@ def setTrainMode(model, phase):
 
 def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
             returnDynamic=False, removeGround=True, loss="deflow", debug=False,
-            sigmaTarget="nll"):
+            sigmaTarget="nll", failureTau=0.10, failureStrata="dynamic", collect=None):
     pc0, pc1 = sample["pc0"], sample["pc1"]
     gtAll = sample["flow"]
     validAll = sample["isValid"]
     dynamicAll = sample["isDynamic"]
+    categoryAll = sample["categoryIndices"]
 
     # Ground removal happens before voxelization, so the per-point GT must be
     # subset the same way: mask0 (the in-range mask) indexes the kept points.
@@ -164,17 +185,21 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
         keep1 = ~sample["isGround1"]
         pc0, pc1 = pc0[keep0], pc1[keep1]
         gtAll, validAll, dynamicAll = gtAll[keep0], validAll[keep0], dynamicAll[keep0]
+        categoryAll = categoryAll[keep0]
 
     # Phases 2 and 3 use partial no_grad: backbone under no_grad, heads with
     # autograd. The frozen heads need no special handling -- requires_grad=False on
     # their parameters plus a grad-free d0 already keeps them out of the graph.
-    if phase in (2, 3) and not returnDynamic:
+    if phase in (2, 3):
         with torch.no_grad():
             d0, pc0ToUnion, inv0Point, mask0, rel0Point, xyz0Point = runForwardFeatures(
                 model, pc0, pc1, voxelSize, pointRange, device)
         pred, predLogVar = runForwardHeads(model, d0, pc0ToUnion, inv0Point, rel0Point, xyz0Point)
+        failLogit = (runFailureHead(model, d0, pc0ToUnion, inv0Point, rel0Point, xyz0Point)
+                     if sigmaTarget == "failure" else None)
     else:
         pred, predLogVar, mask0 = runForward(model, pc0, pc1, voxelSize, pointRange, device)
+        failLogit = None
 
     gt = gtAll.to(device, non_blocking=True)[mask0]
     valid = validAll.to(device, non_blocking=True)[mask0]
@@ -211,11 +236,37 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
         metrics["nllMed"] = pointNll.median()
         metrics["sigma"] = var.sqrt().mean()
         metrics["cover90"] = (sqErr / var <= _CHI2_90_DF3).float().mean()
+        if collect is not None and sigmaTarget == "failure":
+            errV = torch.linalg.vector_norm(pred.float() - gt.float(), dim=1)[valid]
+            rows = torch.stack([failLogit.float()[valid], errV, dyn[valid].float()], dim=1)
+            # Cap per sample: keeping every val point is ~4.6 GB an epoch, and a few
+            # hundred per sweep already pins the AUC to well under its bootstrap width.
+            if rows.shape[0] > _COLLECT_PER_SAMPLE:
+                sel = torch.randperm(rows.shape[0], device=rows.device)[:_COLLECT_PER_SAMPLE]
+                rows = rows[sel]
+            collect.append(rows.cpu())
         return metrics
 
     if phase in (2, 3):
-        lossVal = (sigmaRegressionLoss(pred, predLogVar, gt, valid) if sigmaTarget == "logErr"
-                   else betaNllLoss(pred, predLogVar, gt, valid, beta=beta))
+        if sigmaTarget == "failure":
+            # Foreground only. Background is 80% of points and its failure label is
+            # tautological -- its GT flow is identically zero, so ||e|| = ||pred|| and
+            # "will this fail" is just "is the prediction large". Training on it drags
+            # the head toward the easy majority: a smoke run improved pooled AUC
+            # 0.683 -> 0.761 while FG_DYNAMIC AUC FELL 0.467 -> 0.385.
+            cat = categoryAll.to(device, non_blocking=True)[mask0]
+            dynM = dynamicAll.to(device, non_blocking=True)[mask0]
+            if failureStrata == "dynamic":
+                sel = valid & (cat != 0) & dynM
+            elif failureStrata == "foreground":
+                sel = valid & (cat != 0)
+            else:
+                sel = valid
+            lossVal = failureLoss(failLogit, pred, gt, sel, tau=failureTau)
+        elif sigmaTarget == "logErr":
+            lossVal = sigmaRegressionLoss(pred, predLogVar, gt, valid)
+        else:
+            lossVal = betaNllLoss(pred, predLogVar, gt, valid, beta=beta)
     else:
         lossVal = deflowLoss(pred, gt, valid) if loss == "deflow" else epeLoss(pred, gt, valid)
     if debug and not torch.isfinite(lossVal):
@@ -295,11 +346,13 @@ def main():
     parser.add_argument("--datasetDir", type=Path, default=DEFAULT_DATASET_DIR)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--cacheDir", type=Path, default=DEFAULT_CACHE_DIR)
-    parser.add_argument("--fitSet", default="train", choices=["train", "uncFit"],
-                        help="frozen index set to train on; uncFit is the val+pseudoTest "
-                             "carve the uncertainty head is calibrated against")
-    parser.add_argument("--evalSet", default="val", choices=["val", "pseudoTest", "uncHoldout"],
-                        help="frozen index set to evaluate on each epoch")
+    parser.add_argument("--fitSet", default="train",
+                        help="frozen index set to train on: train | uncFit | uncFold<k>Fit. "
+                             "uncFit is the val+pseudoTest carve the uncertainty head is "
+                             "calibrated against; uncFold<k>Fit is a cross-fitting fold")
+    parser.add_argument("--evalSet", default="val",
+                        help="frozen index set to evaluate on each epoch: "
+                             "val | pseudoTest | uncHoldout | uncFold<k>Eval")
     parser.add_argument("--trainSamples", type=int, default=-1,
                         help="cap number of training samples; -1 uses the full cached set")
     parser.add_argument("--valSamples", type=int, default=-1,
@@ -354,7 +407,16 @@ def main():
                         help="1 = EPE training; 2 = beta-NLL uncertainty-only training, "
                              "flow path frozen bit-identical; "
                              "3 = joint flow+uncertainty training (Option B)")
-    parser.add_argument("--sigmaTarget", choices=["nll", "logErr"], default="nll",
+    parser.add_argument("--failureStrata", choices=["all", "foreground", "dynamic"],
+                        default="dynamic",
+                        help="which points the failure loss is computed on. Default dynamic: "
+                             "background's label is tautological (|e| = ||pred|| there) and "
+                             "fg-static is the easy half of foreground, so training on either "
+                             "drags the head off the stratum the ceiling was measured on -- "
+                             "smoke runs raised pooled AUC while FG_DYNAMIC AUC fell")
+    parser.add_argument("--failureTau", type=float, default=0.10,
+                        help="failure threshold in metres for --sigmaTarget failure")
+    parser.add_argument("--sigmaTarget", choices=["nll", "logErr", "failure"], default="nll",
                         help="phase-2/3 sigma objective. 'logErr' regresses log sigma onto "
                              "log(|e|/sqrt(3)) under MSE in log space instead of using NLL: "
                              "an oracle-style ceiling on what any head can extract from the "
@@ -433,7 +495,7 @@ def main():
         print(f"  missing keys (expected uncertaintyHead.*): {missing}")
         print(f"  unexpected keys (should be empty): {unexpected}")
         for name, p in model.named_parameters():
-            if not name.startswith(trainablePrefixes(args.phase)):
+            if not name.startswith(trainablePrefixes(args.phase, args.sigmaTarget)):
                 p.requires_grad = False
         nTrainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         nTotal = sum(p.numel() for p in model.parameters())
@@ -489,7 +551,7 @@ def main():
             resumePath, model, opt, sched, scaler, device, voxelSize=args.voxelSize)
 
     for epoch in range(startEpoch, args.epochs):
-        setTrainMode(model, args.phase)
+        setTrainMode(model, args.phase, args.sigmaTarget)
         trainSumDev = torch.zeros((), device=device)
         trainN = 0
         t0 = time.time()
@@ -503,7 +565,7 @@ def main():
                 loss = runStep(model, sample, device, args.voxelSize, pointRange,
                                phase=args.phase, beta=args.beta,
                                removeGround=args.removeGround, loss=args.loss,
-                               sigmaTarget=args.sigmaTarget,
+                               sigmaTarget=args.sigmaTarget, failureStrata=args.failureStrata,
                                debug=args.debugAnomaly)
             if not torch.isfinite(loss):
                 # Skip the bad micro-batch before backward so accumulated grads
@@ -580,6 +642,7 @@ def main():
         # dynamic points at all; averaging over its own finite count keeps one
         # missing stratum from poisoning the others.
         valSums, valCounts = {}, {}
+        collected = [] if args.sigmaTarget == "failure" else None
         with torch.no_grad():
             for sample in valDl:
                 with torch.autocast("cuda", dtype=ampDtype, enabled=args.amp):
@@ -587,11 +650,25 @@ def main():
                         model, sample, device, args.voxelSize, pointRange,
                         phase=args.phase, beta=args.beta, returnDynamic=True,
                         removeGround=args.removeGround, loss=args.loss,
-                        sigmaTarget=args.sigmaTarget)
+                        sigmaTarget=args.sigmaTarget, failureTau=args.failureTau,
+                        failureStrata=args.failureStrata, collect=collected)
                 for name, value in metrics.items():
                     if torch.isfinite(value):
                         valSums[name] = valSums.get(name, 0.0) + value.item()
                         valCounts[name] = valCounts.get(name, 0) + 1
+
+        # ROC-AUC over the WHOLE split. A mean of per-sample AUCs is not an AUC, and
+        # per-sample base rates vary enormously here, so it has to be pooled.
+        valAuc = valAucDyn = float("nan")
+        if collected:
+            C = torch.cat(collected)
+            score, errv, dynv = C[:, 0].numpy(), C[:, 1].numpy(), C[:, 2].numpy() > 0.5
+            lab = errv > args.failureTau
+            if lab.any() and (~lab).any():
+                valAuc = rocAuc(lab, score)
+            if dynv.any() and lab[dynv].any() and (~lab[dynv]).any():
+                valAucDyn = rocAuc(lab[dynv], score[dynv])
+            del C
 
         def valMean(name):
             # nan (not 0) when nothing was finite, so divergence stays loud (see §9).
@@ -615,6 +692,7 @@ def main():
                   f"valDynEPE={valDynEpe:.4f}  valStaticEPE={valStaticEpe:.4f}  "
                   f"valNLLmed={valNllMed:.4f}  valNLL={valNll:.4f}  "
                   f"valSigma={valSigma:.5f}  valCover90={valCover90:.4f}  "
+                  f"valAUC={valAuc:.4f}  valAUCdyn={valAucDyn:.4f}  "
                   f"dt={dt:.1f}s  peakVram={peakGb:.2f}GB{skipMsg}{finMsg}", flush=True)
         else:
             print(f"epoch {epoch}: trainLoss={trainLoss:.4f}  valEPE={valEpe:.4f}  "

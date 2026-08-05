@@ -56,7 +56,7 @@ def main():
     parser.add_argument("--outFile", type=Path, required=True)
     parser.add_argument("--valSamples", type=int, default=-1)
     parser.add_argument("--split", default="val",
-                        choices=["val", "pseudoTest", "uncFit", "uncHoldout"])
+                        help="val | pseudoTest | uncFit | uncHoldout | uncFold<k>Eval")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ampDtype", choices=["bf16", "fp16"], default="bf16")
     parser.add_argument("--removeGround", action=argparse.BooleanOptionalAction, default=True)

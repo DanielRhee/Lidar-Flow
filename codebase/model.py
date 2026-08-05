@@ -54,6 +54,14 @@ _LOG_VAR_CLAMP = (-16.0, 6.0)
 # [dec0 feature 32, rel-xyz in voxel 3, |xy| and z 2, predicted flow and its norm 4]
 UNCERTAINTY_IN = 32 + 3 + 2 + 4
 
+# The failure head drops the 4 predicted-flow channels. Measured, not assumed: a
+# gradient-boosting ceiling on the same inputs reaches ROC-AUC 0.7503 from the 32-d
+# feature alone against 0.7533 with all 41, and at a 0.5 m failure threshold dropping
+# them *helps* (0.6897 vs 0.6609). ||predFlow|| is also the mechanism by which the sigma
+# head inverted: it is small exactly on the slow-moving dynamic points that carry the
+# largest errors, so a head handed it learns to be most confident where it is most wrong.
+FAILURE_IN = 32 + 3 + 2
+
 
 def norm(c):
     # GroupNorm, not BatchNorm: it has no running-stat buffers, so train and eval
@@ -148,6 +156,19 @@ class SparseFlowNet(nn.Module):
         # log(1e-3) starts var near the global optimum RMSE^2/3 (~7.8e-4 measured
         # on pseudoTest). The old log(0.1) put sigma ~11x too high.
         nn.init.constant_(self.uncertaintyHead[4].bias, math.log(1e-3))
+        # Failure head: P(||e|| > tau) as a logit. A classifier, not a scale -- the error
+        # distribution is a two-component mixture (the top 0.1% of points carry 58.5% of
+        # sum(sqErr/var)), and forcing one Gaussian scale onto it is what produced the
+        # clamp, sqrt(3), chi-squared and tail pathologies. BCE has none of them.
+        self.failureHead = nn.Sequential(
+            nn.Linear(FAILURE_IN, 128),
+            nn.ReLU(True),
+            nn.Linear(128, 128),
+            nn.ReLU(True),
+            nn.Linear(128, 1),
+        )
+        nn.init.zeros_(self.failureHead[4].weight)
+        nn.init.zeros_(self.failureHead[4].bias)   # starts at p=0.5, learns the base rate
 
     def forwardFeatures(self, x):
         e0 = self.enc0(x)
@@ -196,6 +217,22 @@ def runForwardFeatures(model, pc0, pc1, voxelSize, pointRange, device):
     return d0, pc0ToUnion, inv0Point, mask0, rel0Point, pc0[mask0]
 
 
+# Factored out so a feature dump can reproduce the head's input EXACTLY rather than
+# re-deriving it. The ceiling experiment -- what can any function of these inputs
+# achieve? -- is only meaningful if the features fed to the bound are the ones the head
+# actually sees.
+def uncertaintyInput(pointFeat, rel0Point, xyz0Point, flowDet, includeFlow=True):
+    parts = [
+        pointFeat,
+        rel0Point,
+        torch.linalg.vector_norm(xyz0Point[:, :2], dim=1, keepdim=True) / _XY_SCALE,
+        xyz0Point[:, 2:3] / _Z_SCALE,
+    ]
+    if includeFlow:
+        parts += [flowDet, torch.linalg.vector_norm(flowDet, dim=1, keepdim=True)]
+    return torch.cat([p.to(pointFeat.dtype) for p in parts], dim=1)
+
+
 def runForwardHeads(model, d0, pc0ToUnion, inv0Point, rel0Point, xyz0Point):
     pointToUnion = pc0ToUnion[inv0Point]
     pointFeat = d0.features[pointToUnion]
@@ -206,18 +243,17 @@ def runForwardHeads(model, d0, pc0ToUnion, inv0Point, rel0Point, xyz0Point):
     predPerPoint = voxelFlow + delta
 
     # Detached: sigma is allowed to read the prediction, but must not steer it.
-    flowDet = predPerPoint.detach()
-    uncParts = [
-        pointFeat,
-        rel0Point,
-        torch.linalg.vector_norm(xyz0Point[:, :2], dim=1, keepdim=True) / _XY_SCALE,
-        xyz0Point[:, 2:3] / _Z_SCALE,
-        flowDet,
-        torch.linalg.vector_norm(flowDet, dim=1, keepdim=True),
-    ]
-    uncIn = torch.cat([p.to(pointFeat.dtype) for p in uncParts], dim=1)
+    uncIn = uncertaintyInput(pointFeat, rel0Point, xyz0Point, predPerPoint.detach())
     predLogVarPerPoint = torch.clamp(model.uncertaintyHead(uncIn), *_LOG_VAR_CLAMP).squeeze(-1)
     return predPerPoint, predLogVarPerPoint
+
+
+def runFailureHead(model, d0, pc0ToUnion, inv0Point, rel0Point, xyz0Point):
+    """Per-point failure logit. Separate from runForwardHeads so that function's arity,
+    and its three call sites, stay untouched."""
+    pointFeat = d0.features[pc0ToUnion[inv0Point]]
+    x = uncertaintyInput(pointFeat, rel0Point, xyz0Point, None, includeFlow=False)
+    return model.failureHead(x).squeeze(-1)
 
 
 def runForward(model, pc0, pc1, voxelSize, pointRange, device):
