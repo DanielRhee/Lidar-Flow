@@ -128,11 +128,20 @@ def trainablePrefixes(phase, objective="nll"):
     return ("head.", "refineHead.", "uncertaintyHead.")
 
 
-def failureLoss(logit, pred, gt, valid, tau):
+def failureLoss(logit, pred, gt, valid, tau, normalized=False):
     """BCE on P(||e|| > tau). No clamp, no sqrt(3), no chi-squared, and no 1/var term for
     the tail to dominate -- the pathologies of the scalar-Gaussian formulation are
-    properties of that likelihood, not of the problem."""
+    properties of that likelihood, not of the problem.
+
+    normalized=True switches the label to ||e||/||gt|| > tau -- the fraction of the
+    object's own motion that was missed, which is what Bucket-Normalized EPE scores. The
+    absolute label makes "is this object fast" a valid strategy, and speed is exactly the
+    confound that then has to be conditioned away post hoc; the ratio removes it by
+    construction and makes the output mean the same thing for a pedestrian and a truck.
+    Safe only because the loss is scoped to FG_DYNAMIC, where ||gt|| >= 0.05."""
     err = torch.linalg.vector_norm(pred.float() - gt.float(), dim=1)
+    if normalized:
+        err = err / torch.linalg.vector_norm(gt.float(), dim=1).clamp_min(0.05)
     target = (err > tau).float()[valid]
     z = logit.float()[valid]
     if z.numel() == 0:
@@ -171,7 +180,8 @@ def setTrainMode(model, phase, objective="nll"):
 
 def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
             returnDynamic=False, removeGround=True, loss="deflow", debug=False,
-            sigmaTarget="nll", failureTau=0.10, failureStrata="dynamic", collect=None):
+            sigmaTarget="nll", failureTau=0.10, failureStrata="dynamic",
+            failureNormalized=False, collect=None):
     pc0, pc1 = sample["pc0"], sample["pc1"]
     gtAll = sample["flow"]
     validAll = sample["isValid"]
@@ -262,7 +272,8 @@ def runStep(model, sample, device, voxelSize, pointRange, phase=1, beta=0.5,
                 sel = valid & (cat != 0)
             else:
                 sel = valid
-            lossVal = failureLoss(failLogit, pred, gt, sel, tau=failureTau)
+            lossVal = failureLoss(failLogit, pred, gt, sel, tau=failureTau,
+                                  normalized=failureNormalized)
         elif sigmaTarget == "logErr":
             lossVal = sigmaRegressionLoss(pred, predLogVar, gt, valid)
         else:
@@ -414,6 +425,8 @@ def main():
                              "fg-static is the easy half of foreground, so training on either "
                              "drags the head off the stratum the ceiling was measured on -- "
                              "smoke runs raised pooled AUC while FG_DYNAMIC AUC fell")
+    parser.add_argument("--failureNormalized", action="store_true",
+                        help="label on ||e||/||gt|| > tau instead of ||e|| > tau")
     parser.add_argument("--failureTau", type=float, default=0.10,
                         help="failure threshold in metres for --sigmaTarget failure")
     parser.add_argument("--sigmaTarget", choices=["nll", "logErr", "failure"], default="nll",
@@ -651,7 +664,8 @@ def main():
                         phase=args.phase, beta=args.beta, returnDynamic=True,
                         removeGround=args.removeGround, loss=args.loss,
                         sigmaTarget=args.sigmaTarget, failureTau=args.failureTau,
-                        failureStrata=args.failureStrata, collect=collected)
+                        failureStrata=args.failureStrata,
+                        failureNormalized=args.failureNormalized, collect=collected)
                 for name, value in metrics.items():
                     if torch.isfinite(value):
                         valSums[name] = valSums.get(name, 0.0) + value.item()
